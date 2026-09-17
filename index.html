@@ -645,6 +645,8 @@
       (lastRefreshed ? '<div class="refresh-ts">Refreshed ' + esc(lastRefreshed.toLocaleTimeString()) + '</div>' : '') +
       '</div></div>';
 
+    html += '<div class="chiprow">' + subChip('ALL', 'ALL SUB-UNITS') + APP.subUnits.map(function (s) { return subChip(s.name, s.name); }).join('') + '</div>';
+
     html += '<div class="selector-row"><label>CDS</label><select id="selCDS"><option value="">— select —</option>' +
       cdsOptions.map(function (e) { return '<option value="' + esc(e.id) + '" ' + (APP.dailyDuty.cdsEmployeeId === e.id ? 'selected' : '') + '>' + esc(e.rank) + ' ' + esc(e.name) + '</option>'; }).join('') + '</select></div>';
     html += '<div class="selector-row"><label>CDO</label><select id="selCDO"><option value="">— select —</option>' +
@@ -658,7 +660,6 @@
       }).join('') + '</div>';
     }
 
-    html += '<div class="chiprow">' + subChip('ALL', 'ALL SUB-UNITS') + APP.subUnits.map(function (s) { return subChip(s.name, s.name); }).join('') + '</div>';
     html += '<div class="chiprow">' + chip('ALL', 'ALL') + chip('IN', 'IN') + chip('OUT', 'OUT') + chip('ONDUTY', 'ON DUTY') + chip('LEAVE', 'LEAVES') + chip('MC', 'MC') + '</div>';
     html += '<div class="press-hint">Press and hold anyone to define a more specific reason</div>';
     html += '<div id="empGroups">' + employeeGroupsHtml() + '</div>';
@@ -1058,14 +1059,17 @@
   function applyNextDayAbsencesToStayIn_() {
     var filled = 0;
     var tomorrow = nextDayIso_(APP.date);
-    var relevantCats = ['mc', 'leaves', 'offs'];
+    var relevantCats = ['mc', 'leaves', 'offs', 'ma'];
     APP.employees.forEach(function (emp) {
       if (!isActiveForParade_(emp) || !isTrue(emp.isStayIn)) return;
       var hasExisting = APP.attendance.filter(function (r) { return r.empId === emp.id && r.session === 'STAYIN'; }).length > 0;
       if (hasExisting) return;
       for (var ci = 0; ci < relevantCats.length; ci++) {
-        var listKey = REASON_CATEGORIES[relevantCats[ci]].listKey;
-        var match = (APP[listKey] || []).filter(function (r) { return r.employeeId === emp.id && coversDate_(r, tomorrow); })[0];
+        var catKey = relevantCats[ci];
+        var listKey = REASON_CATEGORIES[catKey].listKey;
+        var candidates = (APP[listKey] || []).filter(function (r) { return r.employeeId === emp.id && coversDate_(r, tomorrow); });
+        // 'ma' category covers both AM MA and PM MA — only AM MA carries into tonight's Stay-in
+        var match = catKey === 'ma' ? candidates.filter(function (r) { return baseReasonNameOf_(r.reason) === 'AM MA'; })[0] : candidates[0];
         if (match) {
           var bucket = bucketForReasonLocal(baseReasonNameOf_(match.reason) || match.reason);
           applyAttendanceLocal({ empId: emp.id, session: 'STAYIN', status: 'Out', reason: match.reason, bucket: bucket });
@@ -1122,6 +1126,8 @@
       newRec = { id: uid_(), employeeId: empId, reasonName: reasonName, reason: reasonString, startDate: startDate, days: days, createdAt: new Date().toISOString() };
       APP[listKey].push(newRec);
     }
+
+    if (catKey === 'mc' || catKey === 'leaves' || catKey === 'offs' || catKey === 'ma') applyNextDayAbsencesToStayIn_();
 
     (async function persist() {
       for (var i = 0; i < toDelete.length; i++) await idbDelete('absenceRecords', toDelete[i]);
@@ -1408,7 +1414,9 @@
       html += '<button class="btn full ghost" id="btnAddSubUnit" style="margin-bottom:10px;">+ ADD SUB-UNIT</button>';
       html += APP.subUnits.map(function (s) {
         var count = APP.employees.filter(function (e) { return e.subUnit === s.name; }).length;
-        return '<div class="list-row" data-subunit="' + esc(s.id) + '"><div><div class="name">' + esc(s.name) + '</div><div class="meta">' + count + ' people</div></div><div class="meta">EDIT</div></div>';
+        return '<div class="list-row" style="cursor:default;"><div><div class="name">' + esc(s.name) + '</div><div class="meta">' + count + ' people</div></div>' +
+          '<div style="display:flex;gap:6px;"><button class="btn small ghost" data-edit-subunit-btn="' + esc(s.id) + '">EDIT</button>' +
+          '<button class="btn small danger" data-del-subunit-btn="' + esc(s.id) + '">DELETE</button></div></div>';
       }).join('') || '<div class="empty-hint">No sub-units yet.</div>';
     } else if (dataSubTab === 'employees') {
       html += '<div class="field-row-2" style="margin-bottom:10px;">' +
@@ -1417,14 +1425,18 @@
       html += APP.employees.map(function (e) {
         var badges = [];
         if (e.isCDS) badges.push('CDS'); if (e.isExcluded) badges.push('EXCL'); if (e.isORD) badges.push('ORD'); if (e.isStayIn) badges.push('STAY-IN');
-        return '<div class="list-row" data-employee="' + esc(e.id) + '"><div><div class="name">' + esc(e.rank) + ' ' + esc(e.name) + '</div><div class="meta">' + esc(e.subUnit) + (badges.length ? ' · ' + badges.join(', ') : '') + '</div></div><div class="meta">EDIT</div></div>';
+        return '<div class="list-row" style="cursor:default;"><div><div class="name">' + esc(e.rank) + ' ' + esc(e.name) + '</div><div class="meta">' + esc(e.subUnit) + (badges.length ? ' · ' + badges.join(', ') : '') + '</div></div>' +
+          '<div style="display:flex;gap:6px;"><button class="btn small ghost" data-edit-employee-btn="' + esc(e.id) + '">EDIT</button>' +
+          '<button class="btn small danger" data-del-employee-btn="' + esc(e.id) + '">DELETE</button></div></div>';
       }).join('') || '<div class="empty-hint">No employees yet.</div>';
     } else if (dataSubTab === 'superiors') {
       html += '<div class="field-row-2" style="margin-bottom:10px;">' +
         '<button class="btn ghost" id="btnAddSuperior" style="flex:1;">+ ADD SUPERIOR</button>' +
         '<button class="btn ghost" id="btnBulkAddSuperior" style="flex:1;">BULK ADD</button></div>';
       html += APP.superiors.map(function (s) {
-        return '<div class="list-row" data-superior="' + esc(s.id) + '"><div><div class="name">' + esc(s.rank) + ' ' + esc(s.name) + '</div><div class="meta">' + esc(s.subUnit) + (s.isCDO ? ' · CDO' : '') + '</div></div><div class="meta">EDIT</div></div>';
+        return '<div class="list-row" style="cursor:default;"><div><div class="name">' + esc(s.rank) + ' ' + esc(s.name) + '</div><div class="meta">' + esc(s.subUnit) + (s.isCDO ? ' · CDO' : '') + '</div></div>' +
+          '<div style="display:flex;gap:6px;"><button class="btn small ghost" data-edit-superior-btn="' + esc(s.id) + '">EDIT</button>' +
+          '<button class="btn small danger" data-del-superior-btn="' + esc(s.id) + '">DELETE</button></div></div>';
       }).join('') || '<div class="empty-hint">No superiors yet.</div>';
     } else if (dataSubTab === 'company') {
       html += '<div class="banner">This name appears on the first line of every exported Parade State.</div>';
@@ -1526,7 +1538,7 @@
         applyAttendanceLocal({ empId: absenceForm.employeeId, session: s, status: bucket === 'In' ? 'In' : 'Out', reason: result.value, bucket: bucket });
       });
     }
-    if (catKey === 'mc' || catKey === 'leaves' || catKey === 'offs') applyNextDayAbsencesToStayIn_();
+    if (catKey === 'mc' || catKey === 'leaves' || catKey === 'offs' || catKey === 'ma') applyNextDayAbsencesToStayIn_();
 
     editingAbsence = { catKey: null, id: null };
     absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
@@ -1610,7 +1622,6 @@
       '<h3>' + (existing ? 'Edit' : 'Add') + ' Sub-Unit</h3>' +
       '<div class="field-row"><label>Name</label><input type="text" id="subUnitName" value="' + esc(existing ? existing.name : '') + '"></div>' +
       '<button class="btn full" id="saveSubUnitBtn" style="margin-bottom:8px;">SAVE</button>' +
-      (existing ? '<button class="btn full danger" id="deleteSubUnitBtn" style="margin-bottom:8px;">DELETE</button>' : '') +
       '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
     document.getElementById('modalRoot').innerHTML = html;
     document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeDataModal(); });
@@ -1623,11 +1634,12 @@
       APP.subUnits = await idbGetAll('subUnits');
       closeDataModal();
     });
-    if (existing) document.getElementById('deleteSubUnitBtn').addEventListener('click', async function () {
-      await idbDelete('subUnits', existing.id);
-      APP.subUnits = await idbGetAll('subUnits');
-      closeDataModal();
-    });
+  }
+  async function deleteSubUnit_(id) {
+    if (!confirm('Delete this sub-unit?')) return;
+    await idbDelete('subUnits', id);
+    APP.subUnits = await idbGetAll('subUnits');
+    render();
   }
   function employeeFormModal(existing) {
     var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
@@ -1641,7 +1653,6 @@
       '<div class="toggle-row"><span>Excluded (temporary)</span><input type="checkbox" id="empIsExcluded" ' + (existing && existing.isExcluded ? 'checked' : '') + '></div>' +
       '<div class="toggle-row"><span>ORD (permanent)</span><input type="checkbox" id="empIsORD" ' + (existing && existing.isORD ? 'checked' : '') + '></div>' +
       '<button class="btn full" id="saveEmpBtn" style="margin:10px 0 8px;">SAVE</button>' +
-      (existing ? '<button class="btn full danger" id="deleteEmpBtn" style="margin-bottom:8px;">DELETE</button>' : '') +
       '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
     document.getElementById('modalRoot').innerHTML = html;
     document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeDataModal(); });
@@ -1663,11 +1674,12 @@
       APP.employees = await idbGetAll('employees');
       closeDataModal();
     });
-    if (existing) document.getElementById('deleteEmpBtn').addEventListener('click', async function () {
-      await idbDelete('employees', existing.id);
-      APP.employees = await idbGetAll('employees');
-      closeDataModal();
-    });
+  }
+  async function deleteEmployee_(id) {
+    if (!confirm('Delete this employee?')) return;
+    await idbDelete('employees', id);
+    APP.employees = await idbGetAll('employees');
+    render();
   }
   function superiorFormModal(existing) {
     var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
@@ -1678,7 +1690,6 @@
       '<div class="field-row"><label>Sub-Unit</label><select id="supSubUnit">' + APP.subUnits.map(function (s) { return '<option ' + (existing && existing.subUnit === s.name ? 'selected' : '') + '>' + esc(s.name) + '</option>'; }).join('') + '</select></div>' +
       '<div class="toggle-row"><span>CDO</span><input type="checkbox" id="supIsCDO" ' + (existing && existing.isCDO ? 'checked' : '') + '></div>' +
       '<button class="btn full" id="saveSupBtn" style="margin:10px 0 8px;">SAVE</button>' +
-      (existing ? '<button class="btn full danger" id="deleteSupBtn" style="margin-bottom:8px;">DELETE</button>' : '') +
       '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
     document.getElementById('modalRoot').innerHTML = html;
     document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeDataModal(); });
@@ -1691,11 +1702,12 @@
       APP.superiors = await idbGetAll('superiors');
       closeDataModal();
     });
-    if (existing) document.getElementById('deleteSupBtn').addEventListener('click', async function () {
-      await idbDelete('superiors', existing.id);
-      APP.superiors = await idbGetAll('superiors');
-      closeDataModal();
-    });
+  }
+  async function deleteSuperior_(id) {
+    if (!confirm('Delete this superior?')) return;
+    await idbDelete('superiors', id);
+    APP.superiors = await idbGetAll('superiors');
+    render();
   }
   function closeDataModal() { document.getElementById('modalRoot').innerHTML = ''; render(); }
 
@@ -1791,9 +1803,12 @@
     var addS = document.getElementById('btnAddSuperior'); if (addS) addS.addEventListener('click', function () { superiorFormModal(null); });
     var bulkAddE = document.getElementById('btnBulkAddEmployee'); if (bulkAddE) bulkAddE.addEventListener('click', function () { openBulkModal('employee'); });
     var bulkAddS = document.getElementById('btnBulkAddSuperior'); if (bulkAddS) bulkAddS.addEventListener('click', function () { openBulkModal('superior'); });
-    document.querySelectorAll('[data-subunit]').forEach(function (r) { r.addEventListener('click', function () { subUnitFormModal(APP.subUnits.filter(function (s) { return s.id === r.getAttribute('data-subunit'); })[0]); }); });
-    document.querySelectorAll('[data-employee]').forEach(function (r) { r.addEventListener('click', function () { employeeFormModal(APP.employees.filter(function (e) { return e.id === r.getAttribute('data-employee'); })[0]); }); });
-    document.querySelectorAll('[data-superior]').forEach(function (r) { r.addEventListener('click', function () { superiorFormModal(APP.superiors.filter(function (s) { return s.id === r.getAttribute('data-superior'); })[0]); }); });
+    document.querySelectorAll('[data-edit-subunit-btn]').forEach(function (r) { r.addEventListener('click', function () { subUnitFormModal(APP.subUnits.filter(function (s) { return s.id === r.getAttribute('data-edit-subunit-btn'); })[0]); }); });
+    document.querySelectorAll('[data-del-subunit-btn]').forEach(function (r) { r.addEventListener('click', function () { deleteSubUnit_(r.getAttribute('data-del-subunit-btn')); }); });
+    document.querySelectorAll('[data-edit-employee-btn]').forEach(function (r) { r.addEventListener('click', function () { employeeFormModal(APP.employees.filter(function (e) { return e.id === r.getAttribute('data-edit-employee-btn'); })[0]); }); });
+    document.querySelectorAll('[data-del-employee-btn]').forEach(function (r) { r.addEventListener('click', function () { deleteEmployee_(r.getAttribute('data-del-employee-btn')); }); });
+    document.querySelectorAll('[data-edit-superior-btn]').forEach(function (r) { r.addEventListener('click', function () { superiorFormModal(APP.superiors.filter(function (s) { return s.id === r.getAttribute('data-edit-superior-btn'); })[0]); }); });
+    document.querySelectorAll('[data-del-superior-btn]').forEach(function (r) { r.addEventListener('click', function () { deleteSuperior_(r.getAttribute('data-del-superior-btn')); }); });
 
     if (REASON_CATEGORIES[dataSubTab]) {
       var catKey = dataSubTab;
