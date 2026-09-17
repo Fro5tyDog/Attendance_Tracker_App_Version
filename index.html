@@ -129,6 +129,13 @@
   .list-row .name { font-size: 13px; }
   .list-row .meta { font-size: 10.5px; color: var(--text-faint); }
 
+  .bulk-textarea { width: 100%; min-height: 90px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 7px; color: var(--text); font-size: 16px; padding: 10px; resize: vertical; outline: none; }
+  .bulk-list { max-height: 300px; overflow-y: auto; margin-bottom: 6px; }
+  .bulk-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; margin-bottom: 6px; }
+  .bulk-name { flex: 1 1 100%; font-size: 12.5px; font-weight: 600; margin-bottom: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .bulk-row select { flex: 1 1 45%; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; color: var(--text); font-size: 12px; padding: 7px 8px; min-width: 0; outline: none; }
+  .bulk-remove { background: transparent; border: 1px solid var(--border); color: var(--out); border-radius: 6px; width: 30px; height: 30px; flex-shrink: 0; cursor: pointer; font-size: 15px; }
+
   .datarow { background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--in); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; }
   .datarow.fp { border-left-color: var(--in); }
   .datarow.lp { border-left-color: var(--mc); }
@@ -218,7 +225,7 @@
 
   // ================= INDEXEDDB DATA LAYER =================
   var DB_NAME = 'paradeStateApp';
-  var DB_VERSION = 2;
+  var DB_VERSION = 3;
   var db = null;
 
   function openDB() {
@@ -233,6 +240,8 @@
         if (!d.objectStoreNames.contains('dailyDuty')) d.createObjectStore('dailyDuty', { keyPath: 'date' });
         if (!d.objectStoreNames.contains('paradeHistory')) d.createObjectStore('paradeHistory', { keyPath: 'key' }); // key = date|session
         if (!d.objectStoreNames.contains('absenceRecords')) d.createObjectStore('absenceRecords', { keyPath: 'id' });
+        if (!d.objectStoreNames.contains('settings')) d.createObjectStore('settings', { keyPath: 'key' });
+        if (!d.objectStoreNames.contains('timePresets')) d.createObjectStore('timePresets', { keyPath: 'id' });
       };
       req.onsuccess = function (e) { db = e.target.result; resolve(db); };
       req.onerror = function (e) { reject(e); };
@@ -353,7 +362,7 @@
   function uid_() { return 'id' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
   // ================= STATE =================
-  var APP = { subUnits: [], employees: [], superiors: [], attendance: [], dailyDuty: {}, date: '', mcRecords: [], leaveRecords: [], maRecords: [], offRecords: [], otherRecords: [] };
+  var APP = { subUnits: [], employees: [], superiors: [], attendance: [], dailyDuty: {}, date: '', mcRecords: [], leaveRecords: [], maRecords: [], offRecords: [], otherRecords: [], companyName: 'BDE HQ Company', timePresets: [] };
   var actualTodayStr = '';
   var dirtyKeys = new Set(); // "empId|session"
   var dailyDutyDirty = false;
@@ -379,6 +388,8 @@
   var editingAbsence = { catKey: null, id: null };
   var pendingDeleteAbsence = { catKey: null, id: null };
   var pendingDeleteAbsenceTimer = null;
+  var bulkKind = null; // 'employee' | 'superior' while the bulk-add modal is open
+  var bulkNames = [];  // [{name, rank, subUnit}]
 
   // ================= BOOT =================
   async function boot() {
@@ -398,6 +409,14 @@
     await loadAttendanceAndDutyForDate_(APP.date);
     historyList = await idbGetAll('paradeHistory');
     await loadAbsenceRecords_();
+    var companySetting = await idbGet('settings', 'companyName');
+    APP.companyName = companySetting ? companySetting.value : 'BDE HQ Company';
+    APP.timePresets = await idbGetAll('timePresets');
+    if (APP.timePresets.length === 0) {
+      var seedTimes = [{ id: uid_(), label: '0745HRS' }, { id: uid_(), label: '1715HRS' }];
+      await idbBulkPut('timePresets', seedTimes);
+      APP.timePresets = seedTimes;
+    }
     runAutoFillPass_();
     render();
   }
@@ -492,7 +511,7 @@
     return null;
   }
   function formatReasonForExport_(reason) {
-    if (reason && reason.indexOf('OOC ') === 0) return 'OOC@' + reason.slice(4);
+    if (reason && reason.indexOf('OOC ') === 0) return 'OOC @ ' + reason.slice(4);
     if (reason && reason.indexOf('OTHER ') === 0) return reason.slice(6);
     return reason;
   }
@@ -514,6 +533,23 @@
     if (cfg.type === 'text') return { needsDays: false, needsText: true, textPlaceholder: cfg.placeholder };
     if (cfg.type === 'text-dates') return { needsDays: true, needsText: true, textPlaceholder: cfg.placeholder };
     return { needsDays: false, needsText: false, textPlaceholder: '' };
+  }
+  /** Recovers the base reason name (e.g. 'MC', 'OOC', 'GD') from any stored
+   *  reason string, whether plain ('GD') or composite ('7D MC 160926-230926',
+   *  'OOC Bedok Camp'). Needed so category-based logic (like Stay-in
+   *  Strength's carry-forward rules) can work from just the attendance
+   *  record's reason string, without threading a separate reasonName field
+   *  through every call site that sets attendance. */
+  function baseReasonNameOf_(reasonStr) {
+    if (!reasonStr) return '';
+    if (REASON_BUCKET.hasOwnProperty(reasonStr)) return reasonStr;
+    var stripped = reasonStr.replace(/^\d+D /, '');
+    var allNames = Object.keys(REASON_BUCKET).slice().sort(function (a, b) { return b.length - a.length; });
+    for (var i = 0; i < allNames.length; i++) {
+      var name = allNames[i];
+      if (stripped === name || stripped.indexOf(name + ' ') === 0) return name;
+    }
+    return '';
   }
 
   // ================= PARADE STATE — rendering =================
@@ -607,6 +643,14 @@
       cdsOptions.map(function (e) { return '<option value="' + esc(e.id) + '" ' + (APP.dailyDuty.cdsEmployeeId === e.id ? 'selected' : '') + '>' + esc(e.rank) + ' ' + esc(e.name) + '</option>'; }).join('') + '</select></div>';
     html += '<div class="selector-row"><label>CDO</label><select id="selCDO"><option value="">— select —</option>' +
       cdoOptions.map(function (s) { return '<option value="' + esc(s.id) + '" ' + (APP.dailyDuty.cdoSuperiorId === s.id ? 'selected' : '') + '>' + esc(s.rank) + ' ' + esc(s.name) + '</option>'; }).join('') + '</select></div>';
+
+    var currentTimeLabel = session === 'AM' ? (APP.dailyDuty.amTimeLabel || '0745HRS') : (APP.dailyDuty.pmTimeLabel || '1715HRS');
+    html += '<div class="selector-row"><label>Time</label><input type="text" id="timeLabelInput" value="' + esc(currentTimeLabel) + '" placeholder="e.g. 0745HRS"></div>';
+    if (APP.timePresets.length) {
+      html += '<div class="chiprow">' + APP.timePresets.map(function (t) {
+        return '<button class="chip" data-time-preset="' + esc(t.label) + '">' + esc(t.label) + '</button>';
+      }).join('') + '</div>';
+    }
 
     html += '<div class="chiprow">' + subChip('ALL', 'ALL SUB-UNITS') + APP.subUnits.map(function (s) { return subChip(s.name, s.name); }).join('') + '</div>';
     html += '<div class="chiprow">' + chip('ALL', 'ALL') + chip('IN', 'IN') + chip('OUT', 'OUT') + chip('ONDUTY', 'ON DUTY') + chip('LEAVE', 'LEAVES') + chip('MC', 'MC') + '</div>';
@@ -849,10 +893,12 @@
       var a = attFor(e.id, sess);
       return { id: e.id, rank: e.rank, name: e.name, subUnit: e.subUnit, status: a.bucket === 'In' ? 'Present' : 'Absent', reason: a.reason || '', bucket: a.bucket };
     });
+    var defaultTime = sess === 'AM' ? '0745HRS' : '1715HRS';
+    var customTime = sess === 'AM' ? APP.dailyDuty.amTimeLabel : sess === 'PM' ? APP.dailyDuty.pmTimeLabel : '';
     return {
       date: APP.date, session: sess,
       label: isStayIn ? 'STAYIN' : (sess === 'AM' ? 'FP' : 'LP'),
-      timeLabel: isStayIn ? '' : (sess === 'AM' ? '0745HRS' : '1715HRS'),
+      timeLabel: isStayIn ? '' : (customTime || defaultTime),
       cds: cdsEmp ? (cdsEmp.rank + ' ' + cdsEmp.name) : '',
       cdo: cdoSup ? (cdoSup.rank + ' ' + cdoSup.name) : '',
       total: total, present: counts.In, people: people
@@ -945,13 +991,19 @@
     });
     return filled;
   }
+  /** PM Parade State -> that same day's Stay-in Strength. Carries MC and
+   *  anything in the 'others' category (GD, ASA, RSO, OOC, MEDIC DUTY, MED
+   *  COVER, BR COHESION, LATE, SKILLSFUTURE, COURSE, BR WORK, OTHER) — not
+   *  OSL/LL/OFF/MA, which stay PM-only. */
   function carryForwardPmToStayIn_() {
     var filled = 0;
-    var CARRY_REASONS = ['ASA', 'GD'];
     APP.employees.forEach(function (emp) {
       if (!isActiveForParade_(emp) || !isTrue(emp.isStayIn)) return;
       var pmRec = APP.attendance.filter(function (r) { return r.empId === emp.id && r.session === 'PM'; })[0];
-      if (!pmRec || CARRY_REASONS.indexOf(pmRec.reason) === -1) return;
+      if (!pmRec || pmRec.bucket === 'In') return;
+      var baseName = baseReasonNameOf_(pmRec.reason);
+      var shouldCarry = baseName === 'MC' || REASON_CATEGORY_OF_NAME[baseName] === 'others';
+      if (!shouldCarry) return;
       var hasExisting = APP.attendance.filter(function (r) { return r.empId === emp.id && r.session === 'STAYIN'; }).length > 0;
       if (hasExisting) return;
       applyAttendanceLocal({ empId: emp.id, session: 'STAYIN', status: 'Out', reason: pmRec.reason, bucket: pmRec.bucket });
@@ -960,6 +1012,13 @@
     });
     return filled;
   }
+  /** Yesterday's saved Stay-in Strength -> today's AM. Only carries 'others'
+   *  category reasons (GD, ASA, RSO, OOC, MEDIC DUTY, MED COVER, BR COHESION,
+   *  LATE, SKILLSFUTURE, COURSE, BR WORK, OTHER) — MC continuing into today is
+   *  handled separately by autoFillActiveLeaves_ (multi-day MC/OSL/LL from
+   *  history), and OSL/LL/OFF continuing or starting today by the absence-
+   *  records sync (applyLocalAbsenceRecordsToToday_). Keeping those on their
+   *  own mechanisms avoids this rule double-applying or conflicting with them. */
   function carryForwardStayInAbsencesToNextAm_() {
     var filled = 0;
     var yesterday = previousDayIso_(APP.date);
@@ -968,6 +1027,8 @@
     var people = (stayInRecord.snapshot && stayInRecord.snapshot.people) || [];
     people.forEach(function (p) {
       if (p.bucket === 'In') return;
+      var baseName = baseReasonNameOf_(p.reason);
+      if (REASON_CATEGORY_OF_NAME[baseName] !== 'others') return;
       var emp = APP.employees.filter(function (e) { return e.id === p.id; })[0];
       if (!emp || !isActiveForParade_(emp)) return;
       var hasExisting = APP.attendance.filter(function (r) { return r.empId === p.id && r.session === 'AM'; }).length > 0;
@@ -1122,13 +1183,28 @@
         var a = attFor(e.id, session);
         return { rank: e.rank, name: e.name, subUnit: e.subUnit, status: a.status, reason: a.reason, bucket: a.bucket };
       });
-      openExportModal({ session: session, dateIso: APP.date, label: session === 'AM' ? 'FP' : 'LP', cds: cdsEmp ? (cdsEmp.rank + ' ' + cdsEmp.name) : '', cdo: cdoSup ? (cdoSup.rank + ' ' + cdoSup.name) : '', people: people });
+      var timeLabelNow = session === 'AM' ? (APP.dailyDuty.amTimeLabel || '0745HRS') : (APP.dailyDuty.pmTimeLabel || '1715HRS');
+      openExportModal({ session: session, dateIso: APP.date, label: session === 'AM' ? 'FP' : 'LP', timeLabel: timeLabelNow, cds: cdsEmp ? (cdsEmp.rank + ' ' + cdsEmp.name) : '', cdo: cdoSup ? (cdoSup.rank + ' ' + cdoSup.name) : '', people: people });
     });
 
     var selCDS = document.getElementById('selCDS');
     if (selCDS) selCDS.addEventListener('change', function () { APP.dailyDuty.cdsEmployeeId = selCDS.value; dailyDutyDirty = true; render(); });
     var selCDO = document.getElementById('selCDO');
     if (selCDO) selCDO.addEventListener('change', function () { APP.dailyDuty.cdoSuperiorId = selCDO.value; dailyDutyDirty = true; render(); });
+
+    var timeInput = document.getElementById('timeLabelInput');
+    if (timeInput) timeInput.addEventListener('input', function () {
+      if (session === 'AM') APP.dailyDuty.amTimeLabel = timeInput.value; else if (session === 'PM') APP.dailyDuty.pmTimeLabel = timeInput.value;
+      dailyDutyDirty = true;
+    });
+    document.querySelectorAll('[data-time-preset]').forEach(function (c) {
+      c.addEventListener('click', function () {
+        var val = c.getAttribute('data-time-preset');
+        if (session === 'AM') APP.dailyDuty.amTimeLabel = val; else if (session === 'PM') APP.dailyDuty.pmTimeLabel = val;
+        dailyDutyDirty = true;
+        render();
+      });
+    });
 
     document.querySelectorAll('[data-filter]').forEach(function (c) { c.addEventListener('click', function () { paradeFilter = c.getAttribute('data-filter'); render(); }); });
     document.querySelectorAll('[data-subfilter]').forEach(function (c) { c.addEventListener('click', function () { paradeSubFilter = c.getAttribute('data-subfilter'); render(); }); });
@@ -1206,12 +1282,12 @@
 
   // ================= EXPORT =================
   function buildExportText_(opts) {
-    var timeLabel = opts.session === 'AM' ? '0745HRS' : '1715HRS';
+    var timeLabel = opts.timeLabel || (opts.session === 'AM' ? '0745HRS' : '1715HRS');
     var total = opts.people.length;
     var present = opts.people.filter(function (p) { return p.bucket === 'In'; }).length;
 
     var lines = [];
-    lines.push('BDE HQ Company (Strength as of ' + opts.label + ', ' + formatDDMMYY_(opts.dateIso) + ', ' + timeLabel + ')');
+    lines.push((APP.companyName || 'BDE HQ Company') + ' (Strength as of ' + opts.label + ', ' + formatDDMMYY_(opts.dateIso) + ', ' + timeLabel + ')');
     lines.push('');
     lines.push('CDO -' + (opts.cdo ? ' ' + opts.cdo.toUpperCase() : ''));
     lines.push('CDS -' + (opts.cds ? ' ' + opts.cds.toUpperCase() : ''));
@@ -1282,6 +1358,7 @@
   // ================= DATA TAB — roster CRUD =================
   function updateDataHtml() {
     var tabs = [['subunits', 'SUB-UNITS'], ['employees', 'EMPLOYEES'], ['superiors', 'SUPERIORS'],
+      ['company', 'COMPANY'], ['time', 'TIME'],
       ['mc', 'MC'], ['leaves', 'LEAVES'], ['ma', 'MA'], ['offs', 'OFFS'], ['others', 'OTHERS']];
     var html = '<div class="chiprow">' + tabs.map(function (t) {
       return '<button class="chip ' + (dataSubTab === t[0] ? 'active' : '') + '" data-datatab="' + t[0] + '">' + t[1] + '</button>';
@@ -1294,17 +1371,32 @@
         return '<div class="list-row" data-subunit="' + esc(s.id) + '"><div><div class="name">' + esc(s.name) + '</div><div class="meta">' + count + ' people</div></div><div class="meta">EDIT</div></div>';
       }).join('') || '<div class="empty-hint">No sub-units yet.</div>';
     } else if (dataSubTab === 'employees') {
-      html += '<button class="btn full ghost" id="btnAddEmployee" style="margin-bottom:10px;">+ ADD EMPLOYEE</button>';
+      html += '<div class="field-row-2" style="margin-bottom:10px;">' +
+        '<button class="btn ghost" id="btnAddEmployee" style="flex:1;">+ ADD EMPLOYEE</button>' +
+        '<button class="btn ghost" id="btnBulkAddEmployee" style="flex:1;">BULK ADD</button></div>';
       html += APP.employees.map(function (e) {
         var badges = [];
         if (e.isCDS) badges.push('CDS'); if (e.isExcluded) badges.push('EXCL'); if (e.isORD) badges.push('ORD'); if (e.isStayIn) badges.push('STAY-IN');
         return '<div class="list-row" data-employee="' + esc(e.id) + '"><div><div class="name">' + esc(e.rank) + ' ' + esc(e.name) + '</div><div class="meta">' + esc(e.subUnit) + (badges.length ? ' · ' + badges.join(', ') : '') + '</div></div><div class="meta">EDIT</div></div>';
       }).join('') || '<div class="empty-hint">No employees yet.</div>';
     } else if (dataSubTab === 'superiors') {
-      html += '<button class="btn full ghost" id="btnAddSuperior" style="margin-bottom:10px;">+ ADD SUPERIOR</button>';
+      html += '<div class="field-row-2" style="margin-bottom:10px;">' +
+        '<button class="btn ghost" id="btnAddSuperior" style="flex:1;">+ ADD SUPERIOR</button>' +
+        '<button class="btn ghost" id="btnBulkAddSuperior" style="flex:1;">BULK ADD</button></div>';
       html += APP.superiors.map(function (s) {
         return '<div class="list-row" data-superior="' + esc(s.id) + '"><div><div class="name">' + esc(s.rank) + ' ' + esc(s.name) + '</div><div class="meta">' + esc(s.subUnit) + (s.isCDO ? ' · CDO' : '') + '</div></div><div class="meta">EDIT</div></div>';
       }).join('') || '<div class="empty-hint">No superiors yet.</div>';
+    } else if (dataSubTab === 'company') {
+      html += '<div class="banner">This name appears on the first line of every exported Parade State.</div>';
+      html += '<div class="field-row"><label>Company name</label><input type="text" id="companyNameInput" value="' + esc(APP.companyName) + '"></div>';
+      html += '<button class="btn full" id="saveCompanyBtn">SAVE</button>';
+    } else if (dataSubTab === 'time') {
+      html += '<div class="banner">Saved time presets show up as quick-pick chips on the Parade State page\'s Time field.</div>';
+      html += '<button class="btn full ghost" id="btnAddTimePreset" style="margin-bottom:10px;">+ ADD TIME PRESET</button>';
+      html += APP.timePresets.map(function (t) {
+        return '<div class="list-row" data-timepreset="' + esc(t.id) + '" style="cursor:default;"><div class="name">' + esc(t.label) + '</div>' +
+          '<button class="btn small danger" data-del-timepreset="' + esc(t.id) + '">DELETE</button></div>';
+      }).join('') || '<div class="empty-hint">No time presets yet.</div>';
     } else if (REASON_CATEGORIES[dataSubTab]) {
       html += absenceRecordsPanel(dataSubTab);
     }
@@ -1565,6 +1657,84 @@
     });
   }
   function closeDataModal() { document.getElementById('modalRoot').innerHTML = ''; render(); }
+
+  // ---------- Bulk add ----------
+  function subUnitOptions(selected) {
+    return APP.subUnits.map(function (su) {
+      return '<option value="' + esc(su.name) + '" ' + (su.name === selected ? 'selected' : '') + '>' + esc(su.name) + '</option>';
+    }).join('');
+  }
+  function openBulkModal(kind) {
+    bulkKind = kind;
+    bulkNames = [];
+    renderBulkModal();
+  }
+  function renderBulkModal() {
+    var ranks = bulkKind === 'employee' ? EMPLOYEE_RANKS : SUPERIOR_RANKS;
+    var rowsHtml = bulkNames.map(function (p, i) {
+      return '<div class="bulk-row">' +
+        '<div class="bulk-name">' + esc(p.name) + '</div>' +
+        '<select data-bulk-rank="' + i + '">' + ranks.map(function (r) { return '<option value="' + r + '" ' + (p.rank === r ? 'selected' : '') + '>' + r + '</option>'; }).join('') + '</select>' +
+        '<select data-bulk-subunit="' + i + '">' + subUnitOptions(p.subUnit) + '</select>' +
+        '<button class="bulk-remove" data-bulk-remove="' + i + '">&times;</button>' +
+        '</div>';
+    }).join('');
+
+    var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
+      '<h3>Bulk add ' + (bulkKind === 'employee' ? 'employees' : 'superiors') + '</h3>' +
+      '<div class="sub">Paste names, one per line (or comma-separated), then set rank &amp; sub-unit for each.</div>' +
+      '<textarea id="bulkTextarea" class="bulk-textarea" placeholder="e.g.&#10;John Tan&#10;Mary Lim&#10;Ahmad Faiz"></textarea>' +
+      '<button class="btn ghost full" id="bulkParseBtn" style="margin:8px 0 14px;">SPLIT NAMES</button>' +
+      (bulkNames.length ? '<div class="bulk-list">' + rowsHtml + '</div>' : '') +
+      (bulkNames.length ? '<button class="btn full" id="bulkAddAllBtn" style="margin-top:6px;">ADD ALL (' + bulkNames.length + ')</button>' : '') +
+      '<button class="modal-close" id="modalClose" style="margin-top:10px;">CANCEL</button>' +
+      '</div></div>';
+
+    document.getElementById('modalRoot').innerHTML = html;
+    bindBulkModalEvents();
+  }
+  function bindBulkModalEvents() {
+    document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeDataModal(); });
+    document.getElementById('modalClose').addEventListener('click', closeDataModal);
+
+    var parseBtn = document.getElementById('bulkParseBtn');
+    if (parseBtn) parseBtn.addEventListener('click', function () {
+      var text = document.getElementById('bulkTextarea').value;
+      var names = text.split(/\r?\n|,/).map(function (s) { return s.trim(); }).filter(function (s) { return s.length > 0; });
+      var defaultRank = (bulkKind === 'employee' ? EMPLOYEE_RANKS : SUPERIOR_RANKS)[0];
+      var defaultSubUnit = APP.subUnits.length ? APP.subUnits[0].name : '';
+      bulkNames = names.map(function (n) { return { name: n, rank: defaultRank, subUnit: defaultSubUnit }; });
+      renderBulkModal();
+    });
+
+    document.querySelectorAll('[data-bulk-rank]').forEach(function (sel) {
+      sel.addEventListener('change', function () { bulkNames[+sel.getAttribute('data-bulk-rank')].rank = sel.value; });
+    });
+    document.querySelectorAll('[data-bulk-subunit]').forEach(function (sel) {
+      sel.addEventListener('change', function () { bulkNames[+sel.getAttribute('data-bulk-subunit')].subUnit = sel.value; });
+    });
+    document.querySelectorAll('[data-bulk-remove]').forEach(function (btn) {
+      btn.addEventListener('click', function () { bulkNames.splice(+btn.getAttribute('data-bulk-remove'), 1); renderBulkModal(); });
+    });
+
+    var addAllBtn = document.getElementById('bulkAddAllBtn');
+    if (addAllBtn) addAllBtn.addEventListener('click', async function () {
+      var payload = bulkNames.map(function (p) { return { rank: p.rank, name: p.name, subUnit: p.subUnit }; });
+      var kind = bulkKind, listKey = kind === 'employee' ? 'employees' : 'superiors', storeName = listKey;
+      closeDataModal();
+      var newRecs = payload.map(function (p) {
+        var obj = { id: uid_(), rank: p.rank, name: p.name, subUnit: p.subUnit };
+        if (kind === 'employee') { obj.isCDS = false; obj.isExcluded = false; obj.isORD = false; obj.isStayIn = false; }
+        else { obj.isCDO = false; }
+        return obj;
+      });
+      APP[listKey] = APP[listKey].concat(newRecs);
+      await idbBulkPut(storeName, newRecs);
+      render();
+      showToast('Added ' + newRecs.length + (kind === 'employee' ? ' employees.' : ' superiors.'));
+    });
+  }
+
   function bindUpdateDataEvents() {
     document.querySelectorAll('[data-datatab]').forEach(function (b) {
       b.addEventListener('click', function () {
@@ -1578,6 +1748,8 @@
     var addSU = document.getElementById('btnAddSubUnit'); if (addSU) addSU.addEventListener('click', function () { subUnitFormModal(null); });
     var addE = document.getElementById('btnAddEmployee'); if (addE) addE.addEventListener('click', function () { employeeFormModal(null); });
     var addS = document.getElementById('btnAddSuperior'); if (addS) addS.addEventListener('click', function () { superiorFormModal(null); });
+    var bulkAddE = document.getElementById('btnBulkAddEmployee'); if (bulkAddE) bulkAddE.addEventListener('click', function () { openBulkModal('employee'); });
+    var bulkAddS = document.getElementById('btnBulkAddSuperior'); if (bulkAddS) bulkAddS.addEventListener('click', function () { openBulkModal('superior'); });
     document.querySelectorAll('[data-subunit]').forEach(function (r) { r.addEventListener('click', function () { subUnitFormModal(APP.subUnits.filter(function (s) { return s.id === r.getAttribute('data-subunit'); })[0]); }); });
     document.querySelectorAll('[data-employee]').forEach(function (r) { r.addEventListener('click', function () { employeeFormModal(APP.employees.filter(function (e) { return e.id === r.getAttribute('data-employee'); })[0]); }); });
     document.querySelectorAll('[data-superior]').forEach(function (r) { r.addEventListener('click', function () { superiorFormModal(APP.superiors.filter(function (s) { return s.id === r.getAttribute('data-superior'); })[0]); }); });
@@ -1598,6 +1770,49 @@
       document.querySelectorAll('[data-edit-absence]').forEach(function (b) { b.addEventListener('click', function () { startEditAbsence_(b.getAttribute('data-catkey'), b.getAttribute('data-edit-absence')); }); });
       document.querySelectorAll('[data-del-absence]').forEach(function (b) { b.addEventListener('click', function () { deleteAbsence_(b.getAttribute('data-catkey'), b.getAttribute('data-del-absence')); }); });
     }
+
+    if (dataSubTab === 'company') {
+      var companyInput = document.getElementById('companyNameInput');
+      var saveCompanyBtn = document.getElementById('saveCompanyBtn');
+      if (saveCompanyBtn) saveCompanyBtn.addEventListener('click', async function () {
+        var val = (companyInput.value || '').trim() || 'BDE HQ Company';
+        APP.companyName = val;
+        await idbBulkPut('settings', [{ key: 'companyName', value: val }]);
+        showToast('Company name saved.');
+        render();
+      });
+    }
+
+    if (dataSubTab === 'time') {
+      var addTimeBtn = document.getElementById('btnAddTimePreset');
+      if (addTimeBtn) addTimeBtn.addEventListener('click', function () { openTimePresetModal(); });
+      document.querySelectorAll('[data-del-timepreset]').forEach(function (b) {
+        b.addEventListener('click', async function () {
+          var id = b.getAttribute('data-del-timepreset');
+          APP.timePresets = APP.timePresets.filter(function (t) { return t.id !== id; });
+          await idbDelete('timePresets', id);
+          render();
+        });
+      });
+    }
+  }
+  function openTimePresetModal() {
+    var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
+      '<h3>Add Time Preset</h3>' +
+      '<div class="field-row"><label>Label</label><input type="text" id="timePresetLabelInput" placeholder="e.g. 0745HRS"></div>' +
+      '<button class="btn full" id="saveTimePresetBtn" style="margin-bottom:8px;">SAVE</button>' +
+      '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
+    document.getElementById('modalRoot').innerHTML = html;
+    document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeDataModal(); });
+    document.getElementById('modalClose').addEventListener('click', closeDataModal);
+    document.getElementById('saveTimePresetBtn').addEventListener('click', async function () {
+      var val = (document.getElementById('timePresetLabelInput').value || '').trim();
+      if (!val) { showToast('Enter a label.'); return; }
+      var rec = { id: uid_(), label: val };
+      APP.timePresets.push(rec);
+      await idbBulkPut('timePresets', [rec]);
+      closeDataModal();
+    });
   }
 
   // ================= HISTORY =================
@@ -1646,7 +1861,7 @@
     var h = historyList.filter(function (x) { return x.key === key; })[0];
     if (!h) return;
     historyViewKey = key;
-    historyViewMeta = { date: h.date, session: h.session, cds: h.snapshot.cds, cdo: h.snapshot.cdo };
+    historyViewMeta = { date: h.date, session: h.session, cds: h.snapshot.cds, cdo: h.snapshot.cdo, timeLabel: h.snapshot.timeLabel };
     historyViewPeople = h.snapshot.people || [];
     historyViewFilter = 'ALL'; historyViewSubFilter = 'ALL';
     render();
@@ -1711,7 +1926,7 @@
     var backBtn = document.getElementById('btnHistoryViewBack'); if (backBtn) backBtn.addEventListener('click', closeHistoryView);
     var exportBtn = document.getElementById('btnHistoryExport');
     if (exportBtn) exportBtn.addEventListener('click', function () {
-      openExportModal({ label: historyViewMeta.session === 'AM' ? 'FP' : 'LP', dateIso: historyViewMeta.date, session: historyViewMeta.session, cds: historyViewMeta.cds, cdo: historyViewMeta.cdo, people: historyViewPeople });
+      openExportModal({ label: historyViewMeta.session === 'AM' ? 'FP' : 'LP', dateIso: historyViewMeta.date, session: historyViewMeta.session, timeLabel: historyViewMeta.timeLabel, cds: historyViewMeta.cds, cdo: historyViewMeta.cdo, people: historyViewPeople });
     });
     document.querySelectorAll('[data-histview-filter]').forEach(function (c) { c.addEventListener('click', function () { historyViewFilter = c.getAttribute('data-histview-filter'); render(); }); });
     document.querySelectorAll('[data-histview-subfilter]').forEach(function (c) { c.addEventListener('click', function () { historyViewSubFilter = c.getAttribute('data-histview-subfilter'); render(); }); });

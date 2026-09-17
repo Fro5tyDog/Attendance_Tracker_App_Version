@@ -81,9 +81,12 @@ instead of this one.
 
 Full AM/PM parade state, all reason types (including MC/OSL/LL with real
 weekday-only date math, COURSE, OOC, OTHER), CDS/CDO, Stay-in Strength with
-both carry-forward rules, employee/sub-unit/superior management, the
-pre-schedule absence-records screens (MC/Leaves/MA/Offs/Others) with full
-two-way sync to live attendance, History with both saved-record formats,
-both export text formats, and the Change Date conflict guard — everything
-from the original shared version now runs the same way, just against
-on-device storage instead of a server.
+both carry-forward rules, employee/sub-unit/superior management (including
+bulk add — paste a list of names, set rank and sub-unit per row, add them
+all at once), the pre-schedule absence-records screens (MC/Leaves/MA/Offs/
+Others) with full two-way sync to live attendance, History with both
+saved-record formats, both export text formats, the Change Date conflict
+guard, a configurable company name (Data tab), and configurable parade-state
+timestamps with a saved-presets list (Data tab) — everything from the
+original shared version now runs the same way, just against on-device
+storage instead of a server.
