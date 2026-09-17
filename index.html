@@ -529,19 +529,15 @@
     if (isTrue(e.isExcluded) && a === null) {
       return '<div class="emprow excluded" data-emp="' + e.id + '">' +
         '<div class="name"><span class="rank">' + esc(e.rank) + '</span>' + esc(e.name) + '</div>' +
-        '<div class="substatus">Excluded — tap to restore</div></div>';
+        '<div class="substatus">Excluded from Parade State — tap to restore</div></div>';
     }
     var cls = BUCKET_CLASS[a.bucket] || 'out';
     var isArmedOut = pendingOut.empId === e.id && pendingOut.session === session && a.bucket === 'In';
-    var badges = [];
-    if (e.isCDS) badges.push('CDS');
-    if (e.isStayIn) badges.push('STAY-IN');
     var sub = isArmedOut ? 'Tap again to mark Out'
       : session === 'STAYIN' ? (a.reason ? a.reason : BUCKET_LABEL[a.bucket])
       : session + ' · ' + (a.reason ? a.reason : BUCKET_LABEL[a.bucket]);
     return '<div class="emprow ' + cls + (isArmedOut ? ' armed' : '') + '" data-emp="' + e.id + '">' +
-      '<div class="name"><span class="rank">' + esc(e.rank) + '</span>' + esc(e.name) +
-      badges.map(function (b) { return ' <span class="badge">' + b + '</span>'; }).join('') + '</div>' +
+      '<div class="name"><span class="rank">' + esc(e.rank) + '</span>' + esc(e.name) + '</div>' +
       '<div class="substatus">' + esc(sub) + '</div></div>';
   }
   function employeeGroupsHtml() {
@@ -714,6 +710,14 @@
     render();
     showToast('Restored to parade state.');
   }
+  function removeFromParadeState_(empId) {
+    var e = APP.employees.filter(function (x) { return x.id === empId; })[0];
+    if (!e) return;
+    e.isExcluded = true;
+    idbBulkPut('employees', [e]);
+    render();
+    showToast('Removed from parade state — tap their row to restore.');
+  }
 
   // ================= reason picker modal (full detail-form support) =================
   function openReasonModal(empId) {
@@ -740,6 +744,7 @@
           '</div>';
       }
       html += '<button class="btn full" id="detailConfirmBtn" style="margin-bottom:8px;">CONFIRM</button>' +
+        '<button class="btn ghost full" id="removeFromParadeBtn" style="margin-bottom:8px;">REMOVE FROM PARADE STATE</button>' +
         '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
     } else {
       html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
@@ -748,11 +753,14 @@
           return '<button class="reason-btn" data-reason="' + esc(r) + '">' + esc(r) + '</button>';
         }).join('') + '</div>' +
         '<button class="btn full ghost" id="btnMarkIn" style="margin:10px 0 8px;">MARK IN</button>' +
+        '<button class="btn ghost full" id="removeFromParadeBtn" style="margin-bottom:8px;">REMOVE FROM PARADE STATE</button>' +
         '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
     }
     document.getElementById('modalRoot').innerHTML = html;
     document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeModal(); });
     document.getElementById('modalClose').addEventListener('click', closeModal);
+    var removeBtn = document.getElementById('removeFromParadeBtn');
+    if (removeBtn) removeBtn.addEventListener('click', function () { removeFromParadeState_(empId); closeModal(); });
 
     if (detailReasonName) {
       var cfg2 = REASONS_WITH_DETAIL[detailReasonName];
@@ -1198,30 +1206,42 @@
 
   // ================= EXPORT =================
   function buildExportText_(opts) {
-    var groups = [];
-    opts.people.forEach(function (p) { if (p.subUnit && groups.indexOf(p.subUnit) === -1) groups.push(p.subUnit); });
+    var timeLabel = opts.session === 'AM' ? '0745HRS' : '1715HRS';
     var total = opts.people.length;
     var present = opts.people.filter(function (p) { return p.bucket === 'In'; }).length;
+
     var lines = [];
-    lines.push('PARADE STATE (' + opts.label + ', ' + formatDDMMYY_(opts.dateIso) + ', ' + (opts.label === 'FP' ? '0745HRS' : '1715HRS') + ')');
+    lines.push('BDE HQ Company (Strength as of ' + opts.label + ', ' + formatDDMMYY_(opts.dateIso) + ', ' + timeLabel + ')');
+    lines.push('');
+    lines.push('CDO -' + (opts.cdo ? ' ' + opts.cdo.toUpperCase() : ''));
+    lines.push('CDS -' + (opts.cds ? ' ' + opts.cds.toUpperCase() : ''));
     lines.push('');
     lines.push('Total - ' + total);
     lines.push('Present - ' + present);
-    lines.push('');
-    lines.push('CDS - ' + (opts.cds ? opts.cds.toUpperCase() : ''));
-    lines.push('CDO - ' + (opts.cdo ? opts.cdo.toUpperCase() : ''));
-    groups.forEach(function (g) {
+
+    var groups = {}, order = [];
+    opts.people.forEach(function (p) {
+      var g = p.subUnit || '—';
+      if (!groups[g]) { groups[g] = []; order.push(g); }
+      groups[g].push(p);
+    });
+
+    order.forEach(function (g) {
+      var members = groups[g];
+      if (!members.length) return;
+      var presentCount = members.filter(function (p) { return p.bucket === 'In'; }).length;
       lines.push('');
-      lines.push(g);
-      var members = opts.people.filter(function (p) { return p.subUnit === g; });
-      members.forEach(function (p, i) {
-        if (p.bucket === 'In') lines.push((i + 1) + '. ' + p.rank + ' ' + p.name);
-        else {
+      lines.push(g + ' - ' + presentCount + '/' + members.length);
+      members.forEach(function (p) {
+        if (p.bucket === 'In') {
+          lines.push(p.rank + ' ' + p.name + ' \u2705');
+        } else {
           var reasonText = formatReasonForExport_(p.reason) || BUCKET_LABEL[p.bucket] || p.bucket;
-          lines.push((i + 1) + '. ' + p.rank + ' ' + p.name + ' (' + reasonText + ')');
+          lines.push(p.rank + ' ' + p.name + ' \u274c (' + reasonText + ')');
         }
       });
     });
+
     return lines.join('\n');
   }
   function buildStayInExportText_(opts) {
