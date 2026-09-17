@@ -179,6 +179,22 @@
   };
   var BUCKET_LABEL = { In: 'In', Out: 'Out', OnDuty: 'On Duty', Leave: 'Leave', MC: 'MC' };
   var BUCKET_CLASS = { In: 'in', Out: 'out', OnDuty: 'onduty', Leave: 'leave', MC: 'mc' };
+  var REASON_CATEGORIES = {
+    mc: { listKey: 'mcRecords', label: 'MC' },
+    leaves: { listKey: 'leaveRecords', label: 'Leaves' },
+    ma: { listKey: 'maRecords', label: 'MA' },
+    offs: { listKey: 'offRecords', label: 'Offs' },
+    others: { listKey: 'otherRecords', label: 'Others' }
+  };
+  var REASON_CATEGORY_OF_NAME = {
+    'MC': 'mc',
+    'OSL': 'leaves', 'LL': 'leaves', 'PM LL': 'leaves', 'AM LL': 'leaves', 'AM OSL': 'leaves', 'PM OSL': 'leaves',
+    'AM MA': 'ma', 'PM MA': 'ma',
+    'OFF': 'offs',
+    'RSO': 'others', 'OOC': 'others', 'ASA': 'others', 'GD': 'others', 'MEDIC DUTY': 'others',
+    'MED COVER': 'others', 'BR COHESION': 'others', 'LATE': 'others', 'SKILLSFUTURE': 'others',
+    'COURSE': 'others', 'BR WORK': 'others', 'OTHER': 'others'
+  };
   var EMPLOYEE_RANKS = ['REC', 'PTE', 'LCP', 'CPL', '3SG', '2SG', '1SG', 'SSG', 'MSG', '2LT', 'LTA'];
   var SUPERIOR_RANKS = ['3SG', '2SG', '1SG', 'SSG', 'MSG', '3WO', '2WO', '1WO', 'MWO', 'SWO', '2LT', 'LTA', 'CPT', 'MAJ', 'LTC', 'SLTC', 'COL'];
 
@@ -202,7 +218,7 @@
 
   // ================= INDEXEDDB DATA LAYER =================
   var DB_NAME = 'paradeStateApp';
-  var DB_VERSION = 1;
+  var DB_VERSION = 2;
   var db = null;
 
   function openDB() {
@@ -216,6 +232,7 @@
         if (!d.objectStoreNames.contains('attendance')) d.createObjectStore('attendance', { keyPath: 'key' }); // key = date|empId|session
         if (!d.objectStoreNames.contains('dailyDuty')) d.createObjectStore('dailyDuty', { keyPath: 'date' });
         if (!d.objectStoreNames.contains('paradeHistory')) d.createObjectStore('paradeHistory', { keyPath: 'key' }); // key = date|session
+        if (!d.objectStoreNames.contains('absenceRecords')) d.createObjectStore('absenceRecords', { keyPath: 'id' });
       };
       req.onsuccess = function (e) { db = e.target.result; resolve(db); };
       req.onerror = function (e) { reject(e); };
@@ -336,7 +353,7 @@
   function uid_() { return 'id' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
   // ================= STATE =================
-  var APP = { subUnits: [], employees: [], superiors: [], attendance: [], dailyDuty: {}, date: '' };
+  var APP = { subUnits: [], employees: [], superiors: [], attendance: [], dailyDuty: {}, date: '', mcRecords: [], leaveRecords: [], maRecords: [], offRecords: [], otherRecords: [] };
   var actualTodayStr = '';
   var dirtyKeys = new Set(); // "empId|session"
   var dailyDutyDirty = false;
@@ -349,6 +366,7 @@
   var stayInLastSaved = null, stayInLastRefreshed = null;
   var pendingOut = { empId: null, session: null };
   var pendingOutTimer = null;
+  var dateChangeModal = { open: false, step: 'pick', pickedDate: '', conflictInfo: '' };
   var historyList = [];
   var historyShowAM = true, historyShowPM = true, historyShowStayIn = true;
   var historyDateFilter = '';
@@ -357,6 +375,10 @@
   var dataSubTab = 'employees';
   var detailReasonName = '', detailDays = 1, detailStartDate = '', detailText = '';
   var replaceReasonConfirmTarget = null;
+  var absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+  var editingAbsence = { catKey: null, id: null };
+  var pendingDeleteAbsence = { catKey: null, id: null };
+  var pendingDeleteAbsenceTimer = null;
 
   // ================= BOOT =================
   async function boot() {
@@ -375,8 +397,18 @@
     actualTodayStr = APP.date;
     await loadAttendanceAndDutyForDate_(APP.date);
     historyList = await idbGetAll('paradeHistory');
+    await loadAbsenceRecords_();
     runAutoFillPass_();
     render();
+  }
+  async function loadAbsenceRecords_() {
+    var all = await idbGetAll('absenceRecords');
+    APP.mcRecords = []; APP.leaveRecords = []; APP.maRecords = []; APP.offRecords = []; APP.otherRecords = [];
+    all.forEach(function (r) {
+      var catKey = REASON_CATEGORY_OF_NAME[r.reasonName];
+      if (!catKey) return;
+      APP[REASON_CATEGORIES[catKey].listKey].push(r);
+    });
   }
 
   async function loadAttendanceAndDutyForDate_(dateIso) {
@@ -463,6 +495,25 @@
     if (reason && reason.indexOf('OOC ') === 0) return 'OOC@' + reason.slice(4);
     if (reason && reason.indexOf('OTHER ') === 0) return reason.slice(6);
     return reason;
+  }
+  function coversDate_(rec, dateStr) {
+    if (!rec || !rec.startDate) return false;
+    var days = parseInt(rec.days, 10) || 1;
+    if (days <= 1) return rec.startDate === dateStr;
+    return weekdayDatesFrom_(rec.startDate, days).indexOf(dateStr) !== -1;
+  }
+  function reasonSessionsFor_(reasonName) {
+    if (reasonName.indexOf('AM ') === 0) return ['AM'];
+    if (reasonName.indexOf('PM ') === 0) return ['PM'];
+    return ['AM', 'PM'];
+  }
+  function adminFieldsFor_(reasonName) {
+    var cfg = REASONS_WITH_DETAIL[reasonName];
+    if (!cfg) return { needsDays: false, needsText: false, textPlaceholder: '' };
+    if (cfg.type === 'dates') return { needsDays: true, needsText: false, textPlaceholder: '' };
+    if (cfg.type === 'text') return { needsDays: false, needsText: true, textPlaceholder: cfg.placeholder };
+    if (cfg.type === 'text-dates') return { needsDays: true, needsText: true, textPlaceholder: cfg.placeholder };
+    return { needsDays: false, needsText: false, textPlaceholder: '' };
   }
 
   // ================= PARADE STATE — rendering =================
@@ -619,6 +670,7 @@
         pendingOut = { empId: null, session: null };
         applyAttendanceLocal({ empId: empId, session: session, status: 'Out', reason: '', bucket: 'Out' });
         dirtyKeys.add(empId + '|' + session);
+        syncAbsenceRecordForLocal_(empId, '', '', APP.date, 1);
         render();
       } else {
         pendingOut = { empId: empId, session: session };
@@ -627,10 +679,32 @@
         render();
       }
     } else {
-      applyAttendanceLocal({ empId: empId, session: session, status: 'In', reason: '', bucket: 'In' });
-      dirtyKeys.add(empId + '|' + session);
-      render();
+      openRemoveReasonConfirmModal_(empId);
     }
+  }
+  function performMarkIn_(empId) {
+    applyAttendanceLocal({ empId: empId, session: session, status: 'In', reason: '', bucket: 'In' });
+    dirtyKeys.add(empId + '|' + session);
+    if (session === 'AM') syncAbsenceRecordForLocal_(empId, '', '', APP.date, 1);
+    render();
+  }
+  function openRemoveReasonConfirmModal_(empId) {
+    var e = APP.employees.filter(function (x) { return x.id === empId; })[0];
+    var a = attFor(empId, session);
+    var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
+      '<h3>Mark In</h3><div class="sub">' + esc(e.rank) + ' ' + esc(e.name) + ' is currently marked "' + esc(a.reason || BUCKET_LABEL[a.bucket]) + '". Type CONFIRM to mark them In instead.</div>' +
+      '<input type="text" id="removeReasonConfirmInput" class="field-row-input" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;margin-bottom:14px;" placeholder="Type CONFIRM" autocomplete="off" autocapitalize="off">' +
+      '<button class="btn full danger" id="removeReasonConfirmBtn" style="margin-bottom:8px;">MARK IN</button>' +
+      '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
+    document.getElementById('modalRoot').innerHTML = html;
+    document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeModal(); });
+    document.getElementById('modalClose').addEventListener('click', closeModal);
+    var input = document.getElementById('removeReasonConfirmInput');
+    document.getElementById('removeReasonConfirmBtn').addEventListener('click', function () {
+      if ((input.value || '').trim().toLowerCase() !== 'confirm') { showToast('Type CONFIRM exactly to proceed.'); return; }
+      performMarkIn_(empId);
+      closeModal();
+    });
   }
   function restoreEmployee_(empId) {
     var e = APP.employees.filter(function (x) { return x.id === empId; })[0];
@@ -691,20 +765,23 @@
           : buildTextReasonString_(detailReasonName, detailText, cfg2.placeholder);
         if (!result.ok) { showToast(result.message); return; }
         var bucket = bucketForReasonLocal(detailReasonName);
+        var syncStartDate = (cfg2.type === 'dates' || cfg2.type === 'text-dates') ? detailStartDate : APP.date;
+        var syncDays = (cfg2.type === 'dates' || cfg2.type === 'text-dates') ? detailDays : 1;
         var currentRec = attFor(empId, session);
         if (currentRec.reason && currentRec.reason !== result.value) {
           closeModal();
-          openReplaceReasonConfirmModal_(empId, result.value, bucket);
+          openReplaceReasonConfirmModal_(empId, detailReasonName, result.value, bucket, syncStartDate, syncDays);
           return;
         }
-        applyReasonToEmp_(empId, result.value, bucket);
+        applyReasonToEmp_(empId, detailReasonName, result.value, bucket, syncStartDate, syncDays);
         closeModal();
       });
     } else {
       document.getElementById('btnMarkIn').addEventListener('click', function () {
-        applyAttendanceLocal({ empId: empId, session: session, status: 'In', reason: '', bucket: 'In' });
-        dirtyKeys.add(empId + '|' + session);
-        render(); closeModal();
+        var currentRec = attFor(empId, session);
+        if (currentRec.reason) { closeModal(); openRemoveReasonConfirmModal_(empId); return; }
+        performMarkIn_(empId);
+        closeModal();
       });
       document.querySelectorAll('[data-reason]').forEach(function (btn) {
         btn.addEventListener('click', function () {
@@ -714,34 +791,38 @@
           var currentRec = attFor(empId, session);
           if (currentRec.reason && currentRec.reason !== r) {
             closeModal();
-            openReplaceReasonConfirmModal_(empId, r, bucket);
+            openReplaceReasonConfirmModal_(empId, r, r, bucket, APP.date, 1);
             return;
           }
-          applyReasonToEmp_(empId, r, bucket);
+          applyReasonToEmp_(empId, r, r, bucket, APP.date, 1);
           closeModal();
         });
       });
     }
   }
-  function applyReasonToEmp_(empId, reasonStr, bucket) {
+  function applyReasonToEmp_(empId, reasonName, reasonStr, bucket, startDate, days) {
     applyAttendanceLocal({ empId: empId, session: session, status: 'Out', reason: reasonStr, bucket: bucket });
     dirtyKeys.add(empId + '|' + session);
+    syncAbsenceRecordForLocal_(empId, reasonName, reasonStr, startDate, days);
     render();
   }
-  function openReplaceReasonConfirmModal_(empId, newReason, newBucket) {
+  function openReplaceReasonConfirmModal_(empId, reasonName, newReason, newBucket, startDate, days) {
     var e = APP.employees.filter(function (x) { return x.id === empId; })[0];
     var current = attFor(empId, session);
-    replaceReasonConfirmTarget = { empId: empId, newReason: newReason, newBucket: newBucket };
+    replaceReasonConfirmTarget = { empId: empId, reasonName: reasonName, newReason: newReason, newBucket: newBucket, startDate: startDate, days: days };
     var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
-      '<h3>Replace Reason</h3><div class="sub">' + esc(e.rank) + ' ' + esc(e.name) + ' is currently "' + esc(current.reason || BUCKET_LABEL[current.bucket]) + '". Change to "' + esc(newReason) + '"?</div>' +
+      '<h3>Replace Reason</h3><div class="sub">' + esc(e.rank) + ' ' + esc(e.name) + ' is currently marked "' + esc(current.reason || BUCKET_LABEL[current.bucket]) + '". Type CONFIRM to change it to "' + esc(newReason) + '".</div>' +
+      '<input type="text" id="replaceReasonConfirmInput" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;margin-bottom:14px;" placeholder="Type CONFIRM" autocomplete="off" autocapitalize="off">' +
       '<button class="btn full danger" id="confirmReplaceBtn" style="margin-bottom:8px;">CONFIRM</button>' +
       '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
     document.getElementById('modalRoot').innerHTML = html;
     document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeModal(); });
     document.getElementById('modalClose').addEventListener('click', closeModal);
+    var input = document.getElementById('replaceReasonConfirmInput');
     document.getElementById('confirmReplaceBtn').addEventListener('click', function () {
+      if ((input.value || '').trim().toLowerCase() !== 'confirm') { showToast('Type CONFIRM exactly to proceed.'); return; }
       var t = replaceReasonConfirmTarget;
-      applyReasonToEmp_(t.empId, t.newReason, t.newBucket);
+      applyReasonToEmp_(t.empId, t.reasonName, t.newReason, t.newBucket, t.startDate, t.days);
       closeModal();
     });
   }
@@ -889,30 +970,115 @@
     });
     return filled;
   }
+  /** Direction A: saved absence records -> today's live view. For every record
+   *  (across all 5 categories) whose range covers today, apply it to anyone who
+   *  doesn't already have an explicit attendance entry for that session today. */
+  function applyLocalAbsenceRecordsToToday_() {
+    Object.keys(REASON_CATEGORIES).forEach(function (catKey) {
+      var listKey = REASON_CATEGORIES[catKey].listKey;
+      (APP[listKey] || []).forEach(function (rec) {
+        if (!coversDate_(rec, APP.date)) return;
+        var bucket = bucketForReasonLocal(rec.reason);
+        reasonSessionsFor_(rec.reasonName).forEach(function (sess) {
+          var hasExisting = APP.attendance.filter(function (r) { return r.empId === rec.employeeId && r.session === sess; }).length > 0;
+          if (hasExisting) return;
+          applyAttendanceLocal({ empId: rec.employeeId, session: sess, status: bucket === 'In' ? 'In' : 'Out', reason: rec.reason, bucket: bucket });
+        });
+      });
+    });
+  }
+
+  /** Direction B: live picker -> saved absence record. Called after every
+   *  attendance-changing action in the live picker. First removes whichever
+   *  existing record (in any category) currently covers today for this
+   *  employee, then, if the newly-applied reason belongs to one of the 5
+   *  categories, writes a fresh record for it. All in-memory (APP) updates
+   *  happen synchronously before any IndexedDB write, so a caller's render()
+   *  right after calling this always sees the final, consistent state —
+   *  the actual persistence to IndexedDB then happens in the background. */
+  function syncAbsenceRecordForLocal_(empId, reasonName, reasonString, startDate, days) {
+    var todayStr = APP.date;
+    var toDelete = [];
+    Object.keys(REASON_CATEGORIES).forEach(function (catKey) {
+      var listKey = REASON_CATEGORIES[catKey].listKey;
+      var keep = [];
+      (APP[listKey] || []).forEach(function (r) {
+        if (r.employeeId === empId && coversDate_(r, todayStr)) toDelete.push(r.id); else keep.push(r);
+      });
+      APP[listKey] = keep;
+    });
+
+    var newRec = null;
+    var catKey = REASON_CATEGORY_OF_NAME[reasonName];
+    if (catKey && reasonName) {
+      var listKey = REASON_CATEGORIES[catKey].listKey;
+      newRec = { id: uid_(), employeeId: empId, reasonName: reasonName, reason: reasonString, startDate: startDate, days: days, createdAt: new Date().toISOString() };
+      APP[listKey].push(newRec);
+    }
+
+    (async function persist() {
+      for (var i = 0; i < toDelete.length; i++) await idbDelete('absenceRecords', toDelete[i]);
+      if (newRec) await idbBulkPut('absenceRecords', [newRec]);
+    })();
+  }
+
   function runAutoFillPass_() {
     var n1 = autoFillActiveLeaves_();
     var n2 = carryForwardAmToPm_();
     var n3 = carryForwardPmToStayIn_();
     var n4 = carryForwardStayInAbsencesToNextAm_();
+    applyLocalAbsenceRecordsToToday_();
     if (n1 || n2 || n3 || n4) showToast('Auto-marked ' + (n1 + n2 + n3 + n4) + ' record(s) — review before saving.');
   }
 
   // ================= CHANGE DATE (simplified — no conflict-typing guard, single-user local app) =================
   function openDateChangeModal() {
-    var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
-      '<h3>Change Date</h3><div class="sub">Switch to a different day — anything unsaved on today stays local until you Save.</div>' +
-      '<div class="field-row"><label>Date</label><input type="date" id="changeDateInput" value="' + esc(APP.date) + '"></div>' +
-      '<button class="btn full" id="changeDateGo" style="margin-bottom:8px;">GO</button>' +
+    dateChangeModal = { open: true, step: 'pick', pickedDate: APP.date, conflictInfo: '' };
+    renderDateChangeModal();
+  }
+  function dateChangeModalHtml() {
+    if (dateChangeModal.step === 'pick') {
+      return '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
+        '<h3>Change Date</h3><div class="sub">Pick a date for Parade State</div>' +
+        '<input type="date" id="dateChangeInput" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;margin-bottom:14px;" value="' + esc(dateChangeModal.pickedDate || APP.date) + '">' +
+        '<button class="btn full" id="dateChangeContinueBtn" style="margin-bottom:8px;">CONTINUE</button>' +
+        '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
+    }
+    return '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
+      '<h3>Record Already Exists</h3><div class="sub">' + esc(dateChangeModal.conflictInfo) + ' Type PROCEED to continue anyway.</div>' +
+      '<input type="text" id="dateChangeConfirmInput" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;margin-bottom:14px;" placeholder="Type PROCEED" autocomplete="off" autocapitalize="off">' +
+      '<button class="btn full danger" id="dateChangeProceedBtn" style="margin-bottom:8px;">PROCEED</button>' +
       '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
-    document.getElementById('modalRoot').innerHTML = html;
-    document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeModal(); });
-    document.getElementById('modalClose').addEventListener('click', closeModal);
-    document.getElementById('changeDateGo').addEventListener('click', async function () {
-      var val = document.getElementById('changeDateInput').value;
-      if (!val) return;
-      document.getElementById('modalRoot').innerHTML = '';
-      await switchToDate_(val);
-    });
+  }
+  function renderDateChangeModal() {
+    document.getElementById('modalRoot').innerHTML = dateChangeModalHtml();
+    document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeDateChangeModal(); });
+    document.getElementById('modalClose').addEventListener('click', closeDateChangeModal);
+    if (dateChangeModal.step === 'pick') {
+      var dateInput = document.getElementById('dateChangeInput');
+      document.getElementById('dateChangeContinueBtn').addEventListener('click', function () {
+        if (!dateInput.value) { showToast('Please pick a date.'); return; }
+        checkDateAndProceed_(dateInput.value);
+      });
+    } else {
+      var confirmInput = document.getElementById('dateChangeConfirmInput');
+      document.getElementById('dateChangeProceedBtn').addEventListener('click', function () {
+        if ((confirmInput.value || '').trim().toLowerCase() !== 'proceed') { showToast('Type PROCEED exactly to continue.'); return; }
+        switchToDate_(dateChangeModal.pickedDate);
+      });
+    }
+  }
+  function closeDateChangeModal() { dateChangeModal = { open: false, step: 'pick', pickedDate: '', conflictInfo: '' }; document.getElementById('modalRoot').innerHTML = ''; render(); }
+  function checkDateAndProceed_(picked) {
+    var matches = historyList.filter(function (h) { return h.date === picked; });
+    if (matches.length === 0) { switchToDate_(picked); return; }
+    var sessionsFound = matches.map(function (h) { return h.session; });
+    var hasAM = sessionsFound.indexOf('AM') !== -1, hasPM = sessionsFound.indexOf('PM') !== -1, hasStayIn = sessionsFound.indexOf('STAYIN') !== -1;
+    var parts = [];
+    if (hasAM) parts.push('AM'); if (hasPM) parts.push('PM'); if (hasStayIn) parts.push('Stay-in Strength');
+    var label = parts.join(' and ') + (parts.length > 1 ? ' are' : ' is') + ' already saved for this date.';
+    dateChangeModal = { open: true, step: 'confirm', pickedDate: picked, conflictInfo: label };
+    renderDateChangeModal();
   }
   async function switchToDate_(dateIso) {
     APP.date = dateIso;
@@ -921,6 +1087,7 @@
     dailyDutyDirty = false;
     lastSaved = null; lastRefreshed = null; stayInLastSaved = null; stayInLastRefreshed = null;
     pendingOut = { empId: null, session: null };
+    closeDateChangeModal();
     runAutoFillPass_();
     render();
   }
@@ -930,7 +1097,7 @@
     var changeDateBtn = document.getElementById('btnChangeDate');
     if (changeDateBtn) changeDateBtn.addEventListener('click', openDateChangeModal);
     var backToTodayBtn = document.getElementById('btnBackToToday');
-    if (backToTodayBtn) backToTodayBtn.addEventListener('click', function () { switchToDate_(actualTodayStr); });
+    if (backToTodayBtn) backToTodayBtn.addEventListener('click', function () { checkDateAndProceed_(actualTodayStr); });
 
     document.querySelectorAll('[data-session]').forEach(function (b) {
       b.addEventListener('click', function () { session = b.getAttribute('data-session'); lastParadeSession = session; render(); });
@@ -1011,7 +1178,7 @@
   }
   function bindStayInEvents() {
     var changeDateBtn = document.getElementById('btnChangeDate'); if (changeDateBtn) changeDateBtn.addEventListener('click', openDateChangeModal);
-    var backToTodayBtn = document.getElementById('btnBackToToday'); if (backToTodayBtn) backToTodayBtn.addEventListener('click', function () { switchToDate_(actualTodayStr); });
+    var backToTodayBtn = document.getElementById('btnBackToToday'); if (backToTodayBtn) backToTodayBtn.addEventListener('click', function () { checkDateAndProceed_(actualTodayStr); });
     var saveBtn = document.getElementById('btnStayInSave'); if (saveBtn) saveBtn.addEventListener('click', saveChanges);
     var rf = document.getElementById('btnStayInRefresh'); if (rf) rf.addEventListener('click', refresh);
     var exportBtn = document.getElementById('btnStayInExport');
@@ -1094,7 +1261,8 @@
 
   // ================= DATA TAB — roster CRUD =================
   function updateDataHtml() {
-    var tabs = [['subunits', 'SUB-UNITS'], ['employees', 'EMPLOYEES'], ['superiors', 'SUPERIORS']];
+    var tabs = [['subunits', 'SUB-UNITS'], ['employees', 'EMPLOYEES'], ['superiors', 'SUPERIORS'],
+      ['mc', 'MC'], ['leaves', 'LEAVES'], ['ma', 'MA'], ['offs', 'OFFS'], ['others', 'OTHERS']];
     var html = '<div class="chiprow">' + tabs.map(function (t) {
       return '<button class="chip ' + (dataSubTab === t[0] ? 'active' : '') + '" data-datatab="' + t[0] + '">' + t[1] + '</button>';
     }).join('') + '</div>';
@@ -1112,14 +1280,178 @@
         if (e.isCDS) badges.push('CDS'); if (e.isExcluded) badges.push('EXCL'); if (e.isORD) badges.push('ORD'); if (e.isStayIn) badges.push('STAY-IN');
         return '<div class="list-row" data-employee="' + esc(e.id) + '"><div><div class="name">' + esc(e.rank) + ' ' + esc(e.name) + '</div><div class="meta">' + esc(e.subUnit) + (badges.length ? ' · ' + badges.join(', ') : '') + '</div></div><div class="meta">EDIT</div></div>';
       }).join('') || '<div class="empty-hint">No employees yet.</div>';
-    } else {
+    } else if (dataSubTab === 'superiors') {
       html += '<button class="btn full ghost" id="btnAddSuperior" style="margin-bottom:10px;">+ ADD SUPERIOR</button>';
       html += APP.superiors.map(function (s) {
         return '<div class="list-row" data-superior="' + esc(s.id) + '"><div><div class="name">' + esc(s.rank) + ' ' + esc(s.name) + '</div><div class="meta">' + esc(s.subUnit) + (s.isCDO ? ' · CDO' : '') + '</div></div><div class="meta">EDIT</div></div>';
       }).join('') || '<div class="empty-hint">No superiors yet.</div>';
+    } else if (REASON_CATEGORIES[dataSubTab]) {
+      html += absenceRecordsPanel(dataSubTab);
     }
     return html;
   }
+
+  // ---------- Absence records (MC / Leaves / MA / Offs / Others) ----------
+  function absenceRecordsPanel(catKey) {
+    var cat = REASON_CATEGORIES[catKey];
+    var list = APP[cat.listKey] || [];
+    var categoryReasons = Object.keys(REASON_CATEGORY_OF_NAME).filter(function (r) { return REASON_CATEGORY_OF_NAME[r] === catKey; });
+
+    if (!absenceForm.reasonName || categoryReasons.indexOf(absenceForm.reasonName) === -1) {
+      absenceForm.reasonName = categoryReasons.length ? categoryReasons[0] : '';
+    }
+
+    var isEditing = editingAbsence.catKey === catKey && !!editingAbsence.id;
+    var fields = adminFieldsFor_(absenceForm.reasonName);
+    var computedEnd = (fields.needsDays && absenceForm.date) ? addWeekdaysIso_(absenceForm.date, absenceForm.days) : '';
+
+    var html = '<div class="field-row"><label>Employee</label><select id="absEmployee">' +
+      '<option value="">— select employee —</option>' +
+      APP.employees.map(function (e) { return '<option value="' + esc(e.id) + '" ' + (absenceForm.employeeId === e.id ? 'selected' : '') + '>' + esc(e.rank) + ' ' + esc(e.name) + '</option>'; }).join('') +
+      '</select></div>';
+
+    html += '<div class="field-row"><label>Reason</label><select id="absReason">' +
+      categoryReasons.map(function (r) { return '<option value="' + esc(r) + '" ' + (absenceForm.reasonName === r ? 'selected' : '') + '>' + esc(r) + '</option>'; }).join('') +
+      '</select></div>';
+
+    if (fields.needsText) {
+      html += '<div class="field-row"><label>' + esc(fields.textPlaceholder) + '</label><input id="absText" placeholder="' + esc(fields.textPlaceholder) + '" value="' + esc(absenceForm.text) + '"></div>';
+    }
+    if (fields.needsDays) {
+      html += '<div class="field-row"><label>Number of days</label><input type="number" min="1" id="absDays" value="' + esc(absenceForm.days) + '"></div>';
+    }
+    html += '<div class="field-row"><label>' + (fields.needsDays ? 'Start date' : 'Date') + '</label><input type="date" id="absDate" value="' + esc(absenceForm.date) + '"></div>';
+    if (fields.needsDays) {
+      html += '<div class="field-row"><label>End date (computed)</label><div class="selector-static">' + esc(computedEnd || '—') + '</div></div>';
+    }
+
+    html += '<button class="btn full" id="absSubmitBtn" style="margin-bottom:' + (isEditing ? '8px' : '16px') + ';">' + (isEditing ? 'SAVE CHANGES' : 'ADD RECORD') + '</button>';
+    if (isEditing) html += '<button class="btn ghost full" id="absCancelBtn" style="margin-bottom:16px;">CANCEL</button>';
+
+    list.forEach(function (rec) {
+      var emp = APP.employees.filter(function (e) { return e.id === rec.employeeId; })[0];
+      var empLabel = emp ? (esc(emp.rank) + ' ' + esc(emp.name)) : '(removed employee)';
+      var isArmed = pendingDeleteAbsence.catKey === catKey && pendingDeleteAbsence.id === rec.id;
+      html += '<div class="list-row" style="cursor:default;"><div><div class="name">' + empLabel + '</div><div class="meta">' + esc(rec.reason) + '</div></div><div style="display:flex;gap:6px;">' +
+        '<button class="btn small ghost" data-edit-absence="' + esc(rec.id) + '" data-catkey="' + catKey + '">EDIT</button>' +
+        '<button class="btn small danger" data-del-absence="' + esc(rec.id) + '" data-catkey="' + catKey + '">' + (isArmed ? 'TAP AGAIN' : 'DELETE') + '</button>' +
+        '</div></div>';
+    });
+    if (list.length === 0) html += '<div class="empty-hint">No records yet.</div>';
+    return html;
+  }
+  function submitAbsenceForm_(catKey) {
+    var cat = REASON_CATEGORIES[catKey];
+    var listKey = cat.listKey;
+
+    if (!absenceForm.employeeId) { showToast('Please select an employee.'); return; }
+    if (!absenceForm.reasonName) { showToast('Please select a reason.'); return; }
+    if (!absenceForm.date) { showToast('Please fill in the date.'); return; }
+
+    var fields = adminFieldsFor_(absenceForm.reasonName);
+    var result;
+    if (fields.needsDays && fields.needsText) result = buildTextDatesReasonString_(absenceForm.reasonName, absenceForm.text, absenceForm.days, absenceForm.date);
+    else if (fields.needsDays) result = buildDatesReasonString_(absenceForm.reasonName, absenceForm.days, absenceForm.date);
+    else if (fields.needsText) result = buildTextReasonString_(absenceForm.reasonName, absenceForm.text, fields.textPlaceholder);
+    else result = { ok: true, value: absenceForm.reasonName };
+    if (!result.ok) { showToast(result.message); return; }
+
+    var days = fields.needsDays ? absenceForm.days : 1;
+    var wasEditing = editingAbsence.catKey === catKey && editingAbsence.id;
+    var rec;
+    if (wasEditing) {
+      rec = APP[listKey].filter(function (r) { return r.id === editingAbsence.id; })[0];
+      if (rec) { rec.employeeId = absenceForm.employeeId; rec.reasonName = absenceForm.reasonName; rec.reason = result.value; rec.startDate = absenceForm.date; rec.days = days; }
+    } else {
+      rec = { id: uid_(), employeeId: absenceForm.employeeId, reasonName: absenceForm.reasonName, reason: result.value, startDate: absenceForm.date, days: days, createdAt: new Date().toISOString() };
+      APP[listKey].push(rec);
+    }
+    idbBulkPut('absenceRecords', [rec]);
+
+    if (coversDate_({ startDate: absenceForm.date, days: days }, APP.date)) {
+      var bucket = bucketForReasonLocal(result.value);
+      reasonSessionsFor_(absenceForm.reasonName).forEach(function (s) {
+        applyAttendanceLocal({ empId: absenceForm.employeeId, session: s, status: bucket === 'In' ? 'In' : 'Out', reason: result.value, bucket: bucket });
+      });
+    }
+
+    editingAbsence = { catKey: null, id: null };
+    absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+    render();
+    showToast(wasEditing ? 'Record updated.' : 'Record added.');
+  }
+  function parseTextReasonString_(reasonName, reasonStr) {
+    if (!reasonStr) return null;
+    var prefix = reasonName + ' ';
+    if (reasonStr.indexOf(prefix) === 0) return { text: reasonStr.slice(prefix.length) };
+    return null;
+  }
+  function parseTextDatesReasonString_(reasonName, reasonStr) {
+    if (!reasonStr) return null;
+    var escaped = reasonName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    var multi = reasonStr.match(new RegExp('^(\\d+)D ' + escaped + ' (.+) (\\d{6})-(\\d{6})$'));
+    if (multi) return { days: parseInt(multi[1], 10), text: multi[2], startDate: ddmmyyToIso_(multi[3]), endDate: ddmmyyToIso_(multi[4]) };
+    var single = reasonStr.match(new RegExp('^' + escaped + ' (.+) (\\d{6})$'));
+    if (single) return { days: 1, text: single[1], startDate: ddmmyyToIso_(single[2]), endDate: '' };
+    return null;
+  }
+  function startEditAbsence_(catKey, id) {
+    var cat = REASON_CATEGORIES[catKey];
+    var rec = (APP[cat.listKey] || []).filter(function (r) { return r.id === id; })[0];
+    if (!rec) return;
+    var days = parseInt(rec.days, 10) || 1;
+    var fields = adminFieldsFor_(rec.reasonName);
+    var text = '';
+    if (fields.needsText) {
+      var parsed = fields.needsDays ? parseTextDatesReasonString_(rec.reasonName, rec.reason) : parseTextReasonString_(rec.reasonName, rec.reason);
+      if (parsed) text = parsed.text;
+    }
+    absenceForm = { employeeId: rec.employeeId, reasonName: rec.reasonName, days: days, date: rec.startDate, text: text };
+    editingAbsence = { catKey: catKey, id: id };
+    render();
+  }
+  function deleteAbsence_(catKey, id) {
+    if (pendingDeleteAbsence.catKey === catKey && pendingDeleteAbsence.id === id) {
+      clearTimeout(pendingDeleteAbsenceTimer);
+      pendingDeleteAbsence = { catKey: null, id: null };
+      openDeleteAbsenceConfirmModal_(catKey, id);
+      return;
+    }
+    pendingDeleteAbsence = { catKey: catKey, id: id };
+    clearTimeout(pendingDeleteAbsenceTimer);
+    pendingDeleteAbsenceTimer = setTimeout(function () { pendingDeleteAbsence = { catKey: null, id: null }; render(); }, 1500);
+    render();
+  }
+  function openDeleteAbsenceConfirmModal_(catKey, id) {
+    var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
+      '<h3>Delete Record</h3><div class="sub">This also clears the matching attendance entries if this record covers today. Type CONFIRM to proceed.</div>' +
+      '<input type="text" id="deleteAbsConfirmInput" style="width:100%;background:var(--panel-2);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:10px;margin-bottom:14px;" placeholder="Type CONFIRM" autocomplete="off" autocapitalize="off">' +
+      '<button class="btn full danger" id="deleteAbsConfirmBtn" style="margin-bottom:8px;">DELETE</button>' +
+      '<button class="modal-close" id="modalClose">CANCEL</button></div></div>';
+    document.getElementById('modalRoot').innerHTML = html;
+    document.getElementById('modalOverlay').addEventListener('click', function (ev) { if (ev.target.id === 'modalOverlay') closeModal(); });
+    document.getElementById('modalClose').addEventListener('click', closeModal);
+    var input = document.getElementById('deleteAbsConfirmInput');
+    document.getElementById('deleteAbsConfirmBtn').addEventListener('click', function () {
+      if ((input.value || '').trim().toLowerCase() !== 'confirm') { showToast('Type CONFIRM exactly to proceed.'); return; }
+      performAbsenceDelete_(catKey, id);
+      closeModal();
+    });
+  }
+  function performAbsenceDelete_(catKey, id) {
+    var cat = REASON_CATEGORIES[catKey];
+    var rec = (APP[cat.listKey] || []).filter(function (r) { return r.id === id; })[0];
+    if (!rec) return;
+    APP[cat.listKey] = APP[cat.listKey].filter(function (r) { return r.id !== id; });
+    idbDelete('absenceRecords', id);
+    if (coversDate_(rec, APP.date)) {
+      reasonSessionsFor_(rec.reasonName).forEach(function (s) {
+        applyAttendanceLocal({ empId: rec.employeeId, session: s, status: 'In', reason: '', bucket: 'In' });
+      });
+    }
+    render();
+  }
+
   function subUnitFormModal(existing) {
     var html = '<div class="modal-overlay" id="modalOverlay"><div class="modal-sheet">' +
       '<h3>' + (existing ? 'Edit' : 'Add') + ' Sub-Unit</h3>' +
@@ -1214,13 +1546,38 @@
   }
   function closeDataModal() { document.getElementById('modalRoot').innerHTML = ''; render(); }
   function bindUpdateDataEvents() {
-    document.querySelectorAll('[data-datatab]').forEach(function (b) { b.addEventListener('click', function () { dataSubTab = b.getAttribute('data-datatab'); render(); }); });
+    document.querySelectorAll('[data-datatab]').forEach(function (b) {
+      b.addEventListener('click', function () {
+        dataSubTab = b.getAttribute('data-datatab');
+        editingAbsence = { catKey: null, id: null };
+        absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+        window.scrollTo(0, 0);
+        render();
+      });
+    });
     var addSU = document.getElementById('btnAddSubUnit'); if (addSU) addSU.addEventListener('click', function () { subUnitFormModal(null); });
     var addE = document.getElementById('btnAddEmployee'); if (addE) addE.addEventListener('click', function () { employeeFormModal(null); });
     var addS = document.getElementById('btnAddSuperior'); if (addS) addS.addEventListener('click', function () { superiorFormModal(null); });
     document.querySelectorAll('[data-subunit]').forEach(function (r) { r.addEventListener('click', function () { subUnitFormModal(APP.subUnits.filter(function (s) { return s.id === r.getAttribute('data-subunit'); })[0]); }); });
     document.querySelectorAll('[data-employee]').forEach(function (r) { r.addEventListener('click', function () { employeeFormModal(APP.employees.filter(function (e) { return e.id === r.getAttribute('data-employee'); })[0]); }); });
     document.querySelectorAll('[data-superior]').forEach(function (r) { r.addEventListener('click', function () { superiorFormModal(APP.superiors.filter(function (s) { return s.id === r.getAttribute('data-superior'); })[0]); }); });
+
+    if (REASON_CATEGORIES[dataSubTab]) {
+      var catKey = dataSubTab;
+      var empSel = document.getElementById('absEmployee'); if (empSel) empSel.addEventListener('change', function () { absenceForm.employeeId = empSel.value; });
+      var reasonSel = document.getElementById('absReason'); if (reasonSel) reasonSel.addEventListener('change', function () { absenceForm.reasonName = reasonSel.value; render(); });
+      var textInput = document.getElementById('absText'); if (textInput) textInput.addEventListener('input', function () { absenceForm.text = textInput.value; });
+      var daysInput = document.getElementById('absDays'); if (daysInput) daysInput.addEventListener('input', function () { absenceForm.days = parseInt(daysInput.value, 10) || 1; render(); });
+      var dateInput = document.getElementById('absDate'); if (dateInput) dateInput.addEventListener('change', function () { absenceForm.date = dateInput.value; render(); });
+      var submitBtn = document.getElementById('absSubmitBtn'); if (submitBtn) submitBtn.addEventListener('click', function () { submitAbsenceForm_(catKey); });
+      var cancelBtn = document.getElementById('absCancelBtn'); if (cancelBtn) cancelBtn.addEventListener('click', function () {
+        editingAbsence = { catKey: null, id: null };
+        absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+        render();
+      });
+      document.querySelectorAll('[data-edit-absence]').forEach(function (b) { b.addEventListener('click', function () { startEditAbsence_(b.getAttribute('data-catkey'), b.getAttribute('data-edit-absence')); }); });
+      document.querySelectorAll('[data-del-absence]').forEach(function (b) { b.addEventListener('click', function () { deleteAbsence_(b.getAttribute('data-catkey'), b.getAttribute('data-del-absence')); }); });
+    }
   }
 
   // ================= HISTORY =================
