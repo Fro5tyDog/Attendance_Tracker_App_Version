@@ -77,6 +77,14 @@ losing a phone means losing that data — if that's a real risk for how you'll
 use this, that's a good reason to revisit the shared/server-backed version
 instead of this one.
 
+## Updating after a fresh deploy
+
+The service worker fetches network-first: every load checks for a fresh
+version before falling back to what's cached, so pushing an update to your
+host (e.g. GitHub Pages) is picked up on the next normal reload — no need to
+clear site data or use an incognito window. It only falls back to the last
+cached version when there's genuinely no connectivity.
+
 ## What's included
 
 Full AM/PM parade state, all reason types (including MC/OSL/LL with real

@@ -62,7 +62,6 @@
   .btn.small { padding: 8px 12px; font-size: 11.5px; }
   .btn.danger { background: var(--out); color: #2a0e08; border-color: var(--out); }
   .savebtn.dirty { background: var(--in); color: #06251a; border-color: var(--in); }
-  .refreshbtn { background: transparent; border: none; color: var(--text-dim); font-size: 11px; text-decoration: underline; cursor: pointer; padding: 8px 4px; }
   .export-row { margin-bottom: 10px; }
 
   .segmented { display: flex; background: var(--panel); border: 1px solid var(--border); border-radius: 9px; padding: 3px; margin-bottom: 10px; gap: 3px; }
@@ -77,7 +76,7 @@
 
   .selector-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
   .selector-row label { font-size: 10.5px; color: var(--text-faint); letter-spacing: 0.06em; width: 34px; flex-shrink: 0; }
-  .selector-row select { flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 10px; }
+  .selector-row select, .selector-row input { flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 9px 10px; }
   .selector-static { flex: 1; background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim); border-radius: 8px; padding: 9px 10px; font-size: 12.5px; }
 
   .chiprow { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -339,6 +338,12 @@
   function previousDayIso_(iso) {
     var d = new Date(iso + 'T00:00:00');
     d.setDate(d.getDate() - 1);
+    var pad = function (v) { return (v < 10 ? '0' : '') + v; };
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+  function nextDayIso_(iso) {
+    var d = new Date(iso + 'T00:00:00');
+    d.setDate(d.getDate() + 1);
     var pad = function (v) { return (v < 10 ? '0' : '') + v; };
     return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
   }
@@ -635,8 +640,9 @@
 
     html += '<div class="sectionhead"><h2>PARADE STATE</h2><div>' +
       '<div class="pshead-btns"><button class="btn small savebtn ' + (isDirty ? 'dirty' : '') + '" id="btnSave">SAVE' + (isDirty ? ' •' : '') + '</button>' +
-      '<button class="refreshbtn" id="btnRefresh">REFRESH</button></div>' +
+      '<button class="btn small ghost" id="btnRefresh">REFRESH</button></div>' +
       (lastSaved ? '<div class="refresh-ts">Saved ' + esc(lastSaved.toLocaleTimeString()) + '</div>' : '') +
+      (lastRefreshed ? '<div class="refresh-ts">Refreshed ' + esc(lastRefreshed.toLocaleTimeString()) + '</div>' : '') +
       '</div></div>';
 
     html += '<div class="selector-row"><label>CDS</label><select id="selCDS"><option value="">— select —</option>' +
@@ -1039,6 +1045,38 @@
     });
     return filled;
   }
+  /** Anyone with an MC, OSL/LL, or OFF absence record covering TOMORROW (the
+   *  day after Stay-in Strength's own date) gets marked absent in TODAY'S
+   *  Stay-in Strength too — someone who knows they're on MC/leave/off
+   *  starting tomorrow has typically already left camp tonight rather than
+   *  staying in and leaving first thing in the morning. This is separate
+   *  from carryForwardStayInAbsencesToNextAm_ (which looks backward, from
+   *  yesterday's Stay-in into today's AM) — this looks forward, checking
+   *  what's coming up next against tonight's headcount. Only checks MC/
+   *  Leaves/Offs absence records — not MA or 'others', which are covered by
+   *  the same-day PM reference in carryForwardPmToStayIn_ instead. */
+  function applyNextDayAbsencesToStayIn_() {
+    var filled = 0;
+    var tomorrow = nextDayIso_(APP.date);
+    var relevantCats = ['mc', 'leaves', 'offs'];
+    APP.employees.forEach(function (emp) {
+      if (!isActiveForParade_(emp) || !isTrue(emp.isStayIn)) return;
+      var hasExisting = APP.attendance.filter(function (r) { return r.empId === emp.id && r.session === 'STAYIN'; }).length > 0;
+      if (hasExisting) return;
+      for (var ci = 0; ci < relevantCats.length; ci++) {
+        var listKey = REASON_CATEGORIES[relevantCats[ci]].listKey;
+        var match = (APP[listKey] || []).filter(function (r) { return r.employeeId === emp.id && coversDate_(r, tomorrow); })[0];
+        if (match) {
+          var bucket = bucketForReasonLocal(baseReasonNameOf_(match.reason) || match.reason);
+          applyAttendanceLocal({ empId: emp.id, session: 'STAYIN', status: 'Out', reason: match.reason, bucket: bucket });
+          dirtyKeys.add(emp.id + '|STAYIN');
+          filled++;
+          break;
+        }
+      }
+    });
+    return filled;
+  }
   /** Direction A: saved absence records -> today's live view. For every record
    *  (across all 5 categories) whose range covers today, apply it to anyone who
    *  doesn't already have an explicit attendance entry for that session today. */
@@ -1047,7 +1085,7 @@
       var listKey = REASON_CATEGORIES[catKey].listKey;
       (APP[listKey] || []).forEach(function (rec) {
         if (!coversDate_(rec, APP.date)) return;
-        var bucket = bucketForReasonLocal(rec.reason);
+        var bucket = bucketForReasonLocal(baseReasonNameOf_(rec.reason) || rec.reason);
         reasonSessionsFor_(rec.reasonName).forEach(function (sess) {
           var hasExisting = APP.attendance.filter(function (r) { return r.empId === rec.employeeId && r.session === sess; }).length > 0;
           if (hasExisting) return;
@@ -1096,8 +1134,9 @@
     var n2 = carryForwardAmToPm_();
     var n3 = carryForwardPmToStayIn_();
     var n4 = carryForwardStayInAbsencesToNextAm_();
+    var n5 = applyNextDayAbsencesToStayIn_();
     applyLocalAbsenceRecordsToToday_();
-    if (n1 || n2 || n3 || n4) showToast('Auto-marked ' + (n1 + n2 + n3 + n4) + ' record(s) — review before saving.');
+    if (n1 || n2 || n3 || n4 || n5) showToast('Auto-marked ' + (n1 + n2 + n3 + n4 + n5) + ' record(s) — review before saving.');
   }
 
   // ================= CHANGE DATE (simplified — no conflict-typing guard, single-user local app) =================
@@ -1251,8 +1290,9 @@
     html += statusMsg;
     html += '<div class="sectionhead"><h2>STAY-IN STRENGTH</h2><div>' +
       '<div class="pshead-btns"><button class="btn small savebtn ' + (isDirty ? 'dirty' : '') + '" id="btnStayInSave">SAVE' + (isDirty ? ' •' : '') + '</button>' +
-      '<button class="refreshbtn" id="btnStayInRefresh">REFRESH</button></div>' +
-      (stayInLastSaved ? '<div class="refresh-ts">Saved ' + esc(stayInLastSaved.toLocaleTimeString()) + '</div>' : '') + '</div></div>';
+      '<button class="btn small ghost" id="btnStayInRefresh">REFRESH</button></div>' +
+      (stayInLastSaved ? '<div class="refresh-ts">Saved ' + esc(stayInLastSaved.toLocaleTimeString()) + '</div>' : '') +
+      (stayInLastRefreshed ? '<div class="refresh-ts">Refreshed ' + esc(stayInLastRefreshed.toLocaleTimeString()) + '</div>' : '') + '</div></div>';
     html += '<div class="selector-row"><label>CDS</label><select id="selStayInCDS"><option value="">— select —</option>' +
       cdsOptions.map(function (e) { return '<option value="' + esc(e.id) + '" ' + (APP.dailyDuty.stayInCdsEmployeeId === e.id ? 'selected' : '') + '>' + esc(e.rank) + ' ' + esc(e.name) + '</option>'; }).join('') + '</select></div>';
     html += '<div class="chiprow">' + chip('ALL', 'ALL') + chip('IN', 'IN') + chip('OUT', 'OUT') + chip('ONDUTY', 'ON DUTY') + chip('LEAVE', 'LEAVES') + chip('MC', 'MC') + '</div>';
@@ -1481,11 +1521,12 @@
     idbBulkPut('absenceRecords', [rec]);
 
     if (coversDate_({ startDate: absenceForm.date, days: days }, APP.date)) {
-      var bucket = bucketForReasonLocal(result.value);
+      var bucket = bucketForReasonLocal(baseReasonNameOf_(result.value) || result.value);
       reasonSessionsFor_(absenceForm.reasonName).forEach(function (s) {
         applyAttendanceLocal({ empId: absenceForm.employeeId, session: s, status: bucket === 'In' ? 'In' : 'Out', reason: result.value, bucket: bucket });
       });
     }
+    if (catKey === 'mc' || catKey === 'leaves' || catKey === 'offs') applyNextDayAbsencesToStayIn_();
 
     editingAbsence = { catKey: null, id: null };
     absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
@@ -1960,7 +2001,7 @@
         else if (newTab !== 'stayin' && session === 'STAYIN') { session = lastParadeSession; }
         mainTab = newTab;
         historyViewKey = null;
-        if (mainTab === 'stayin') carryForwardPmToStayIn_();
+        if (mainTab === 'stayin') { carryForwardPmToStayIn_(); applyNextDayAbsencesToStayIn_(); }
         window.scrollTo(0, 0);
         render();
       });
