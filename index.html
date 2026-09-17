@@ -335,6 +335,27 @@
     }
     return count;
   }
+  /** Keeps {days, startDate, endDate} internally consistent regardless of
+   *  which one the user just edited — pick either direction: set Days and
+   *  the end date follows, or set an End date directly and Days follows.
+   *  Returns the updated {days, startDate, endDate}. Editing 'end' snaps the
+   *  result back through addWeekdaysIso_ so the stored end date always lands
+   *  on a real weekday boundary consistent with the day count — typing a
+   *  Saturday, say, resolves to whichever weekday actually completes that
+   *  many working days from the start. */
+  function reconcileDateRange_(state, changedField) {
+    var days = state.days, startDate = state.startDate, endDate = state.endDate;
+    if (changedField === 'end') {
+      if (startDate && endDate) {
+        days = countWeekdaysBetween_(startDate, endDate);
+        endDate = addWeekdaysIso_(startDate, days);
+      }
+    } else {
+      // 'days' or 'start' changed — end date follows, keeping the duration fixed
+      endDate = startDate ? addWeekdaysIso_(startDate, days) : '';
+    }
+    return { days: days, startDate: startDate, endDate: endDate };
+  }
   function previousDayIso_(iso) {
     var d = new Date(iso + 'T00:00:00');
     d.setDate(d.getDate() - 1);
@@ -387,9 +408,9 @@
   var historyViewKey = null, historyViewMeta = null, historyViewPeople = null;
   var historyViewFilter = 'ALL', historyViewSubFilter = 'ALL';
   var dataSubTab = 'employees';
-  var detailReasonName = '', detailDays = 1, detailStartDate = '', detailText = '';
+  var detailReasonName = '', detailDays = 1, detailStartDate = '', detailEndDate = '', detailText = '';
   var replaceReasonConfirmTarget = null;
-  var absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+  var absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', endDate: '', text: '' };
   var editingAbsence = { catKey: null, id: null };
   var pendingDeleteAbsence = { catKey: null, id: null };
   var pendingDeleteAbsenceTimer = null;
@@ -774,7 +795,7 @@
   function openReasonModal(empId) {
     var e = APP.employees.filter(function (x) { return x.id === empId; })[0];
     if (!e) return;
-    detailReasonName = ''; detailDays = 1; detailStartDate = APP.date; detailText = '';
+    detailReasonName = ''; detailDays = 1; detailStartDate = APP.date; detailEndDate = APP.date; detailText = '';
     renderReasonModal(empId, e);
   }
   function renderReasonModal(empId, e) {
@@ -792,7 +813,8 @@
         html += '<div class="field-row-2">' +
           '<div class="field-row"><label>Days</label><input type="number" id="detailDaysInput" min="1" value="' + detailDays + '"></div>' +
           '<div class="field-row"><label>Start date</label><input type="date" id="detailStartInput" value="' + esc(detailStartDate) + '"></div>' +
-          '</div>';
+          '</div>' +
+          '<div class="field-row"><label>End date</label><input type="date" id="detailEndInput" value="' + esc(detailEndDate) + '"></div>';
       }
       html += '<button class="btn full" id="detailConfirmBtn" style="margin-bottom:8px;">CONFIRM</button>' +
         '<button class="btn ghost full" id="removeFromParadeBtn" style="margin-bottom:8px;">REMOVE FROM PARADE STATE</button>' +
@@ -816,8 +838,27 @@
     if (detailReasonName) {
       var cfg2 = REASONS_WITH_DETAIL[detailReasonName];
       var ti = document.getElementById('detailTextInput'); if (ti) ti.addEventListener('input', function () { detailText = ti.value; });
-      var di = document.getElementById('detailDaysInput'); if (di) di.addEventListener('input', function () { detailDays = parseInt(di.value, 10) || 1; });
-      var si = document.getElementById('detailStartInput'); if (si) si.addEventListener('change', function () { detailStartDate = si.value; });
+      var di = document.getElementById('detailDaysInput');
+      if (di) di.addEventListener('change', function () {
+        detailDays = parseInt(di.value, 10) || 1;
+        var r = reconcileDateRange_({ days: detailDays, startDate: detailStartDate, endDate: detailEndDate }, 'days');
+        detailDays = r.days; detailEndDate = r.endDate;
+        renderReasonModal(empId, e);
+      });
+      var si = document.getElementById('detailStartInput');
+      if (si) si.addEventListener('change', function () {
+        detailStartDate = si.value;
+        var r = reconcileDateRange_({ days: detailDays, startDate: detailStartDate, endDate: detailEndDate }, 'start');
+        detailDays = r.days; detailEndDate = r.endDate;
+        renderReasonModal(empId, e);
+      });
+      var eiInput = document.getElementById('detailEndInput');
+      if (eiInput) eiInput.addEventListener('change', function () {
+        detailEndDate = eiInput.value;
+        var r = reconcileDateRange_({ days: detailDays, startDate: detailStartDate, endDate: detailEndDate }, 'end');
+        detailDays = r.days; detailEndDate = r.endDate;
+        renderReasonModal(empId, e);
+      });
       document.getElementById('detailConfirmBtn').addEventListener('click', function () {
         var result = cfg2.type === 'dates' ? buildDatesReasonString_(detailReasonName, detailDays, detailStartDate)
           : cfg2.type === 'text-dates' ? buildTextDatesReasonString_(detailReasonName, detailText, detailDays, detailStartDate)
@@ -1467,7 +1508,9 @@
 
     var isEditing = editingAbsence.catKey === catKey && !!editingAbsence.id;
     var fields = adminFieldsFor_(absenceForm.reasonName);
-    var computedEnd = (fields.needsDays && absenceForm.date) ? addWeekdaysIso_(absenceForm.date, absenceForm.days) : '';
+    if (fields.needsDays && absenceForm.date && !absenceForm.endDate) {
+      absenceForm.endDate = addWeekdaysIso_(absenceForm.date, absenceForm.days);
+    }
 
     var html = '<div class="field-row"><label>Employee</label><select id="absEmployee">' +
       '<option value="">— select employee —</option>' +
@@ -1486,7 +1529,7 @@
     }
     html += '<div class="field-row"><label>' + (fields.needsDays ? 'Start date' : 'Date') + '</label><input type="date" id="absDate" value="' + esc(absenceForm.date) + '"></div>';
     if (fields.needsDays) {
-      html += '<div class="field-row"><label>End date (computed)</label><div class="selector-static">' + esc(computedEnd || '—') + '</div></div>';
+      html += '<div class="field-row"><label>End date</label><input type="date" id="absEndDate" value="' + esc(absenceForm.endDate) + '"></div>';
     }
 
     html += '<button class="btn full" id="absSubmitBtn" style="margin-bottom:' + (isEditing ? '8px' : '16px') + ';">' + (isEditing ? 'SAVE CHANGES' : 'ADD RECORD') + '</button>';
@@ -1541,7 +1584,7 @@
     if (catKey === 'mc' || catKey === 'leaves' || catKey === 'offs' || catKey === 'ma') applyNextDayAbsencesToStayIn_();
 
     editingAbsence = { catKey: null, id: null };
-    absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+    absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', endDate: '', text: '' };
     render();
     showToast(wasEditing ? 'Record updated.' : 'Record added.');
   }
@@ -1571,7 +1614,8 @@
       var parsed = fields.needsDays ? parseTextDatesReasonString_(rec.reasonName, rec.reason) : parseTextReasonString_(rec.reasonName, rec.reason);
       if (parsed) text = parsed.text;
     }
-    absenceForm = { employeeId: rec.employeeId, reasonName: rec.reasonName, days: days, date: rec.startDate, text: text };
+    var endDate = fields.needsDays ? addWeekdaysIso_(rec.startDate, days) : '';
+    absenceForm = { employeeId: rec.employeeId, reasonName: rec.reasonName, days: days, date: rec.startDate, endDate: endDate, text: text };
     editingAbsence = { catKey: catKey, id: id };
     render();
   }
@@ -1793,7 +1837,7 @@
       b.addEventListener('click', function () {
         dataSubTab = b.getAttribute('data-datatab');
         editingAbsence = { catKey: null, id: null };
-        absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+        absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', endDate: '', text: '' };
         window.scrollTo(0, 0);
         render();
       });
@@ -1813,14 +1857,33 @@
     if (REASON_CATEGORIES[dataSubTab]) {
       var catKey = dataSubTab;
       var empSel = document.getElementById('absEmployee'); if (empSel) empSel.addEventListener('change', function () { absenceForm.employeeId = empSel.value; });
-      var reasonSel = document.getElementById('absReason'); if (reasonSel) reasonSel.addEventListener('change', function () { absenceForm.reasonName = reasonSel.value; render(); });
+      var reasonSel = document.getElementById('absReason'); if (reasonSel) reasonSel.addEventListener('change', function () { absenceForm.reasonName = reasonSel.value; absenceForm.endDate = ''; render(); });
       var textInput = document.getElementById('absText'); if (textInput) textInput.addEventListener('input', function () { absenceForm.text = textInput.value; });
-      var daysInput = document.getElementById('absDays'); if (daysInput) daysInput.addEventListener('input', function () { absenceForm.days = parseInt(daysInput.value, 10) || 1; render(); });
-      var dateInput = document.getElementById('absDate'); if (dateInput) dateInput.addEventListener('change', function () { absenceForm.date = dateInput.value; render(); });
+      var daysInput = document.getElementById('absDays');
+      if (daysInput) daysInput.addEventListener('change', function () {
+        absenceForm.days = parseInt(daysInput.value, 10) || 1;
+        var r = reconcileDateRange_({ days: absenceForm.days, startDate: absenceForm.date, endDate: absenceForm.endDate }, 'days');
+        absenceForm.days = r.days; absenceForm.endDate = r.endDate;
+        render();
+      });
+      var dateInput = document.getElementById('absDate');
+      if (dateInput) dateInput.addEventListener('change', function () {
+        absenceForm.date = dateInput.value;
+        var r = reconcileDateRange_({ days: absenceForm.days, startDate: absenceForm.date, endDate: absenceForm.endDate }, 'start');
+        absenceForm.days = r.days; absenceForm.endDate = r.endDate;
+        render();
+      });
+      var endDateInput = document.getElementById('absEndDate');
+      if (endDateInput) endDateInput.addEventListener('change', function () {
+        absenceForm.endDate = endDateInput.value;
+        var r = reconcileDateRange_({ days: absenceForm.days, startDate: absenceForm.date, endDate: absenceForm.endDate }, 'end');
+        absenceForm.days = r.days; absenceForm.endDate = r.endDate;
+        render();
+      });
       var submitBtn = document.getElementById('absSubmitBtn'); if (submitBtn) submitBtn.addEventListener('click', function () { submitAbsenceForm_(catKey); });
       var cancelBtn = document.getElementById('absCancelBtn'); if (cancelBtn) cancelBtn.addEventListener('click', function () {
         editingAbsence = { catKey: null, id: null };
-        absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', text: '' };
+        absenceForm = { employeeId: '', reasonName: '', days: 1, date: '', endDate: '', text: '' };
         render();
       });
       document.querySelectorAll('[data-edit-absence]').forEach(function (b) { b.addEventListener('click', function () { startEditAbsence_(b.getAttribute('data-catkey'), b.getAttribute('data-edit-absence')); }); });
