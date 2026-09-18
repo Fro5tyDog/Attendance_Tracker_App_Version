@@ -1,7 +1,16 @@
-// Caches the app shell on install so the app opens even with zero connectivity.
-// All actual data lives in IndexedDB (see index.html), never in this cache —
-// this only makes the app's own code available offline.
-var CACHE_NAME = 'parade-state-v1';
+// Caches the app shell so it still opens with zero connectivity. All actual
+// data lives in IndexedDB (see index.html), never in this cache — this only
+// makes the app's own code available offline.
+//
+// Network-first, not cache-first: every load tries the network before
+// falling back to whatever was last cached. This matters because a
+// cache-first strategy would keep serving the very first version ever
+// installed forever, even after a fresh deploy (e.g. pushing an update to
+// GitHub Pages) — the only way out would be manually clearing site data or
+// an incognito window. Network-first means a normal reload always picks up
+// the latest deploy when there's connectivity, and only falls back to the
+// cached version when there genuinely isn't any.
+var CACHE_NAME = 'parade-state-shell-v1';
 var SHELL_FILES = [
   './index.html',
   './manifest.json',
@@ -29,19 +38,17 @@ self.addEventListener('activate', function (event) {
   self.clients.claim();
 });
 
-// Cache-first for the app shell, falling back to network — this app has no
-// server API to worry about, so there's no dynamic request caching to do.
 self.addEventListener('fetch', function (event) {
   if (event.request.method !== 'GET') return;
   event.respondWith(
-    caches.match(event.request).then(function (cached) {
-      return cached || fetch(event.request).then(function (response) {
-        var copy = response.clone();
-        caches.open(CACHE_NAME).then(function (cache) { cache.put(event.request, copy); });
-        return response;
-      }).catch(function () {
-        // Offline and not cached — for navigations, fall back to the cached shell.
-        if (event.request.mode === 'navigate') return caches.match('./index.html');
+    fetch(event.request).then(function (response) {
+      var copy = response.clone();
+      caches.open(CACHE_NAME).then(function (cache) { cache.put(event.request, copy); });
+      return response;
+    }).catch(function () {
+      // Offline — fall back to whatever was cached from the last successful load.
+      return caches.match(event.request).then(function (cached) {
+        return cached || (event.request.mode === 'navigate' ? caches.match('./index.html') : undefined);
       });
     })
   );
